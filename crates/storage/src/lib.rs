@@ -1,0 +1,376 @@
+//! Postgres-backed storage layer.
+//!
+//! v1 uses runtime-validated `sqlx::query` rather than the compile-time-checked
+//! `query!` macros, so the workspace builds without a live database. Once the
+//! schema has stabilised, swap call sites for the macros and add a `.sqlx/`
+//! offline cache to keep CI fast. Validation today happens through the
+//! integration tests in `tests/`.
+
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
+use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::{PgPool, Row};
+use thiserror::Error;
+
+use botcore::{
+    Alert, AlertScope, AlertState, ChatType, Language, NewAlert, RecurrencePattern, User,
+};
+
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("database error: {0}")]
+    Sql(#[from] sqlx::Error),
+    #[error("migration failed: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("invalid timezone in db: {0}")]
+    InvalidTimezone(String),
+    #[error("invalid language in db: {0}")]
+    InvalidLanguage(String),
+    #[error("invalid enum value: {0}")]
+    InvalidEnum(String),
+}
+
+pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[derive(Clone)]
+pub struct PgStore {
+    pool: PgPool,
+}
+
+impl PgStore {
+    pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(url)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn migrate(&self) -> Result<()> {
+        sqlx::migrate!("../../migrations").run(&self.pool).await?;
+        Ok(())
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+impl PgStore {
+    /// Insert-or-update by `telegram_id`. Existing rows keep their timezone
+    /// and language so user-set preferences aren't clobbered by every message.
+    pub async fn upsert_user(&self, telegram_id: i64, default_language: Language) -> Result<User> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO users (telegram_id, language)
+            VALUES ($1, $2)
+            ON CONFLICT (telegram_id) DO UPDATE SET updated_at = now()
+            RETURNING telegram_id, timezone, language, created_at, updated_at
+            "#,
+        )
+        .bind(telegram_id)
+        .bind(default_language.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row_to_user(row)
+    }
+
+    pub async fn get_user(&self, telegram_id: i64) -> Result<Option<User>> {
+        let row = sqlx::query(
+            r#"
+            SELECT telegram_id, timezone, language, created_at, updated_at
+            FROM users WHERE telegram_id = $1
+            "#,
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_user).transpose()
+    }
+
+    pub async fn set_timezone(&self, telegram_id: i64, tz: Tz) -> Result<()> {
+        sqlx::query("UPDATE users SET timezone = $1, updated_at = now() WHERE telegram_id = $2")
+            .bind(tz.name())
+            .bind(telegram_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_language(&self, telegram_id: i64, language: Language) -> Result<()> {
+        sqlx::query("UPDATE users SET language = $1, updated_at = now() WHERE telegram_id = $2")
+            .bind(language.as_str())
+            .bind(telegram_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+
+impl PgStore {
+    pub async fn create_alert(&self, new: NewAlert) -> Result<Alert> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO alerts (user_id, chat_id, chat_type, scope, text, fire_at, recurrence)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+                      state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+            "#,
+        )
+        .bind(new.user_id)
+        .bind(new.chat_id)
+        .bind(new.chat_type.as_str())
+        .bind(new.scope.as_str())
+        .bind(&new.text)
+        .bind(new.fire_at)
+        .bind(new.recurrence.as_ref().map(|r| r.serialize()))
+        .fetch_one(&self.pool)
+        .await?;
+
+        row_to_alert(row)
+    }
+
+    pub async fn get_alert(&self, id: i64) -> Result<Option<Alert>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+                   state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+            FROM alerts WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_alert).transpose()
+    }
+
+    /// Active alerts visible in `chat_id` — used by `/list`.
+    /// In a DM `chat_id == user_id`, in a group chat all alerts pinned to the
+    /// group are returned regardless of who created them.
+    pub async fn list_active_for_chat(&self, chat_id: i64) -> Result<Vec<Alert>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+                   state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+            FROM alerts
+            WHERE chat_id = $1 AND state IN ('pending', 'claimed')
+            ORDER BY fire_at ASC
+            "#,
+        )
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_alert).collect()
+    }
+
+    /// Mark `cancelled`, but only if `requester_user_id` is allowed to.
+    /// Returns `true` if a row was actually transitioned, `false` if the alert
+    /// doesn't exist, isn't pending, or the requester lacks permission.
+    pub async fn cancel_alert(&self, id: i64, requester_user_id: i64) -> Result<bool> {
+        // Fetch first to enforce the can_edit predicate in Rust — keeps the
+        // permission rule colocated with the domain type and out of SQL.
+        let Some(alert) = self.get_alert(id).await? else {
+            return Ok(false);
+        };
+        if !alert.can_edit(requester_user_id) {
+            return Ok(false);
+        }
+        if !matches!(alert.state, AlertState::Pending) {
+            return Ok(false);
+        }
+        let res = sqlx::query(
+            "UPDATE alerts SET state = 'cancelled', updated_at = now()
+             WHERE id = $1 AND state = 'pending'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Atomically claim up to `limit` due alerts. Multiple workers can call
+    /// this concurrently — `FOR UPDATE SKIP LOCKED` guarantees no row is
+    /// claimed twice.
+    pub async fn claim_due_alerts(&self, limit: i64) -> Result<Vec<Alert>> {
+        let rows = sqlx::query(
+            r#"
+            UPDATE alerts
+            SET state = 'claimed',
+                attempts = attempts + 1,
+                claimed_at = now(),
+                updated_at = now()
+            WHERE id IN (
+                SELECT id FROM alerts
+                WHERE state = 'pending' AND fire_at <= now()
+                ORDER BY fire_at ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+                      state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_alert).collect()
+    }
+
+    pub async fn mark_sent(&self, id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE alerts SET state = 'sent', fired_at = now(), updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_failed(&self, id: i64, error: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE alerts SET state = 'failed', last_error = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Re-queue: bumps `state` back to `pending` with a new `fire_at`.
+    /// Used by retry logic when Telegram returns 429 (rate-limited).
+    pub async fn reschedule(&self, id: i64, fire_at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL, updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(fire_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reaper: rows stuck in `claimed` longer than the timeout were owned by
+    /// a worker that crashed mid-send. Reset them so another worker picks up.
+    pub async fn release_stale_claims(&self, timeout_secs: i64) -> Result<u64> {
+        let res = sqlx::query(
+            r#"
+            UPDATE alerts
+            SET state = 'pending', claimed_at = NULL, updated_at = now()
+            WHERE state = 'claimed'
+              AND claimed_at < now() - make_interval(secs => $1)
+            "#,
+        )
+        .bind(timeout_secs as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Earliest pending fire time, used by the worker to compute its next
+    /// wake-up timer. `None` means no pending alerts at all.
+    pub async fn next_pending_fire_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let row: Option<(Option<DateTime<Utc>>,)> =
+            sqlx::query_as("SELECT MIN(fire_at) FROM alerts WHERE state = 'pending'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------------
+
+impl PgStore {
+    /// Returns `true` if `update_id` was new and is now recorded; `false` if
+    /// it was a duplicate (= we already processed this Telegram update).
+    pub async fn try_register_update(&self, update_id: i64) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO processed_updates (update_id) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(update_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    pub async fn purge_old_updates(&self, older_than_secs: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "DELETE FROM processed_updates WHERE received_at < now() - make_interval(secs => $1)",
+        )
+        .bind(older_than_secs as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row → domain mapping
+// ---------------------------------------------------------------------------
+
+fn row_to_user(row: PgRow) -> Result<User> {
+    let tz_name: String = row.try_get("timezone")?;
+    let lang_str: String = row.try_get("language")?;
+    let timezone: Tz = tz_name
+        .parse()
+        .map_err(|_| StorageError::InvalidTimezone(tz_name.clone()))?;
+    let language =
+        Language::parse(&lang_str).ok_or_else(|| StorageError::InvalidLanguage(lang_str))?;
+    Ok(User {
+        telegram_id: row.try_get("telegram_id")?,
+        timezone,
+        language,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn row_to_alert(row: PgRow) -> Result<Alert> {
+    let chat_type_str: String = row.try_get("chat_type")?;
+    let scope_str: String = row.try_get("scope")?;
+    let state_str: String = row.try_get("state")?;
+    let recurrence_str: Option<String> = row.try_get("recurrence")?;
+
+    let chat_type =
+        ChatType::parse(&chat_type_str).ok_or_else(|| StorageError::InvalidEnum(chat_type_str))?;
+    let scope = AlertScope::parse(&scope_str).ok_or_else(|| StorageError::InvalidEnum(scope_str))?;
+    let state = AlertState::parse(&state_str).ok_or_else(|| StorageError::InvalidEnum(state_str))?;
+    let recurrence = match recurrence_str {
+        Some(s) => Some(
+            RecurrencePattern::deserialize(&s)
+                .map_err(|e| StorageError::InvalidEnum(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    Ok(Alert {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        chat_id: row.try_get("chat_id")?,
+        chat_type,
+        scope,
+        text: row.try_get("text")?,
+        fire_at: row.try_get("fire_at")?,
+        recurrence,
+        state,
+        attempts: row.try_get("attempts")?,
+        last_error: row.try_get("last_error")?,
+        claimed_at: row.try_get("claimed_at")?,
+        fired_at: row.try_get("fired_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}

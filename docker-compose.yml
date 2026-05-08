@@ -1,0 +1,61 @@
+# Production-ish compose. For local dev without webhooks, leave WEBHOOK_URL
+# unset in `.env` — the bot falls back to long-polling and the cloudflared
+# service is unused.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-alertbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-alertbot}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Ports kept internal — bot reaches DB over the compose network.
+    networks: [alertbot]
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: alert-bot:latest
+    pull_policy: build
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-alertbot}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-alertbot}
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN must be set}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_LISTEN: 0.0.0.0:8080
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      RUST_LOG: ${RUST_LOG:-info,alert_bot=debug}
+    networks: [alertbot]
+
+  # Cloudflare Tunnel exposes the bot's webhook port to the public internet
+  # via a Cloudflare-issued URL (https://<your-tunnel>.trycloudflare.com or
+  # a CNAME you set up in the dashboard). No open ports on the host.
+  #
+  # 1. Create a tunnel in the Cloudflare Zero Trust dashboard.
+  # 2. Add a public hostname route: Service = http://bot:8080
+  # 3. Copy the tunnel TOKEN into `.env` as CLOUDFLARED_TOKEN.
+  # 4. Set WEBHOOK_URL in `.env` to the public URL of that hostname.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    depends_on: [bot]
+    profiles: ["tunnel"]
+    networks: [alertbot]
+
+volumes:
+  postgres_data:
+
+networks:
+  alertbot:

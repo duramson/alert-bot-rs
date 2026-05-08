@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.swp
+.env
+.env.local
+docker-compose.override.yml
