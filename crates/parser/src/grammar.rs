@@ -6,9 +6,24 @@
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc, Weekday};
 
 use crate::keywords::{
-    is_at_prefix, is_in_prefix, is_uhr, match_named_day, match_time_unit, NamedDay,
+    is_at_prefix, is_in_prefix, is_recurring_keyword, is_uhr, match_named_day, match_time_unit,
+    NamedDay,
 };
-use crate::{local_to_utc, ParseContext, ParseError, Parsed, DEFAULT_TIME};
+use crate::{
+    local_to_utc, ParseContext, ParseError, Parsed, RecurrencePattern, DEFAULT_TIME,
+    MIN_INTERVAL_SECONDS,
+};
+use botcore::Recurrence;
+
+const ALL_WEEKDAYS: [Weekday; 7] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+    Weekday::Sat,
+    Weekday::Sun,
+];
 
 /// (text, byte-offset where the token starts in the original input).
 type Token<'a> = (&'a str, usize);
@@ -37,14 +52,52 @@ fn token_end(tok: Token<'_>) -> usize {
 }
 
 pub(crate) fn parse_command(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ParseError::Empty);
+    }
+
+    let (recurring, rest) = strip_recurring_prefix(trimmed);
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Err(ParseError::Empty);
+    }
+
+    if recurring {
+        parse_recurring(rest, ctx)
+    } else {
+        parse_one_shot(rest, ctx)
+    }
+}
+
+/// Strip a `*` prefix or a leading recurring keyword (`every`/`alle`/`jeden`/`jede`).
+fn strip_recurring_prefix(input: &str) -> (bool, &str) {
+    if let Some(rest) = input.strip_prefix('*') {
+        return (true, rest);
+    }
+    let (first, rest_with_space) = match input.split_once(char::is_whitespace) {
+        Some((f, r)) => (f, r),
+        None => (input, ""),
+    };
+    if is_recurring_keyword(first) {
+        return (true, rest_with_space);
+    }
+    (false, input)
+}
+
+// ===========================================================================
+// One-shot
+// ===========================================================================
+
+fn parse_one_shot(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError> {
     let tokens = tokenize(input);
     if tokens.is_empty() {
         return Err(ParseError::Empty);
     }
 
-    let (fire_at, consumed_until, had_explicit_time) = try_relative(&tokens, ctx)
+    let (fire_at, consumed_until, had_explicit_time) = try_relative(&tokens)
         .or_else(|| try_absolute(&tokens, ctx))
-        .or_else(|| try_named_day(&tokens, ctx))
+        .or_else(|| try_named_day(&tokens))
         .ok_or(ParseError::NoTimeExpression)?
         .into_dt(ctx)?;
 
@@ -60,12 +113,11 @@ pub(crate) fn parse_command(input: &str, ctx: &ParseContext) -> Result<Parsed, P
         fire_at,
         text,
         had_explicit_time,
+        recurrence: None,
     })
 }
 
-/// Intermediate result of a parsing strategy. The actual `DateTime<Utc>` is
-/// computed in `into_dt` so each strategy can stay focused on the structural
-/// pattern rather than tz arithmetic.
+/// Intermediate result of a parsing strategy.
 enum Match {
     Relative {
         seconds: i64,
@@ -111,31 +163,38 @@ impl Match {
 // Relative: `5m`, `30d`, `2 stunden`, `in 30 minutes`
 // ---------------------------------------------------------------------------
 
-fn try_relative(tokens: &[Token<'_>], _ctx: &ParseContext) -> Option<Match> {
+fn try_relative(tokens: &[Token<'_>]) -> Option<Match> {
+    let (seconds, end_offset, _) = parse_relative(tokens, true)?;
+    Some(Match::Relative { seconds, end_offset })
+}
+
+/// Shared between one-shot and recurring.
+/// Returns `(seconds, end_offset, end_token_idx_exclusive)`.
+/// `allow_in_prefix=false` for recurring (`*in 5m text` would be weird).
+fn parse_relative(
+    tokens: &[Token<'_>],
+    allow_in_prefix: bool,
+) -> Option<(i64, usize, usize)> {
     let mut i = 0;
-    if tokens.get(i).map_or(false, |t| is_in_prefix(t.0)) {
+    if allow_in_prefix && tokens.get(i).map_or(false, |t| is_in_prefix(t.0)) {
         i += 1;
     }
 
-    let first = tokens.get(i)?;
+    let first = *tokens.get(i)?;
     let (num, suffix_inline) = split_leading_digits(first.0)?;
 
-    let (unit, end_offset) = if !suffix_inline.is_empty() {
-        // `5m` → unit is the suffix part of the same token.
+    let (unit, end_offset, end_idx) = if !suffix_inline.is_empty() {
         (
             match_time_unit(suffix_inline)?,
-            token_end(*first),
+            token_end(first),
+            i + 1,
         )
     } else {
-        // `5 minuten` → unit is the next token.
-        let next = tokens.get(i + 1)?;
-        (match_time_unit(next.0)?, token_end(*next))
+        let next = *tokens.get(i + 1)?;
+        (match_time_unit(next.0)?, token_end(next), i + 2)
     };
 
-    Some(Match::Relative {
-        seconds: unit.as_seconds(num),
-        end_offset,
-    })
+    Some((unit.as_seconds(num), end_offset, end_idx))
 }
 
 /// `"5m"` → `Some((5, "m"))`, `"42"` → `Some((42, ""))`, `"abc"` → `None`.
@@ -153,17 +212,12 @@ fn split_leading_digits(s: &str) -> Option<(i64, &str)> {
 // ---------------------------------------------------------------------------
 
 fn try_absolute(tokens: &[Token<'_>], ctx: &ParseContext) -> Option<Match> {
-    let first = tokens.first()?;
+    let first = *tokens.first()?;
     let date = parse_date_token(first.0, ctx)?;
 
-    // Optional clock token after the date.
-    let (time, end_offset) = consume_optional_time(tokens, 1).unwrap_or((None, token_end(*first)));
+    let (time, end_offset) = consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
 
-    Some(Match::Absolute {
-        date,
-        time,
-        end_offset,
-    })
+    Some(Match::Absolute { date, time, end_offset })
 }
 
 fn parse_date_token(s: &str, ctx: &ParseContext) -> Option<NaiveDate> {
@@ -182,7 +236,6 @@ fn parse_date_token(s: &str, ctx: &ParseContext) -> Option<NaiveDate> {
         let y: i32 = parts[2].parse().ok()?;
         if y < 100 { 2000 + y } else { y }
     } else {
-        // No year: pick this year, roll to next year if the date already passed.
         let current = now_local.year();
         match NaiveDate::from_ymd_opt(current, month, day) {
             Some(d) if d >= now_local.date_naive() => current,
@@ -194,20 +247,16 @@ fn parse_date_token(s: &str, ctx: &ParseContext) -> Option<NaiveDate> {
 }
 
 // ---------------------------------------------------------------------------
-// Named day: `heute`, `morgen`, `übermorgen`, weekdays
+// Named day (one-shot): `heute`, `morgen`, `übermorgen`, weekdays
 // ---------------------------------------------------------------------------
 
-fn try_named_day(tokens: &[Token<'_>], _ctx: &ParseContext) -> Option<Match> {
-    let first = tokens.first()?;
+fn try_named_day(tokens: &[Token<'_>]) -> Option<Match> {
+    let first = *tokens.first()?;
     let day = match_named_day(first.0)?;
 
-    let (time, end_offset) = consume_optional_time(tokens, 1).unwrap_or((None, token_end(*first)));
+    let (time, end_offset) = consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
 
-    Some(Match::Named {
-        day,
-        time,
-        end_offset,
-    })
+    Some(Match::Named { day, time, end_offset })
 }
 
 fn resolve_named_day(day: NamedDay, ctx: &ParseContext) -> NaiveDate {
@@ -220,8 +269,6 @@ fn resolve_named_day(day: NamedDay, ctx: &ParseContext) -> NaiveDate {
     }
 }
 
-/// Strictly *next* occurrence of `target` — saying "Friday" on a Friday means
-/// next Friday, not today.
 fn next_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
     let from_n = from.weekday().num_days_from_monday() as i64;
     let target_n = target.num_days_from_monday() as i64;
@@ -230,6 +277,158 @@ fn next_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
         diff += 7;
     }
     from + chrono::Duration::days(diff)
+}
+
+// ===========================================================================
+// Recurring
+// ===========================================================================
+
+fn parse_recurring(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError> {
+    let tokens = tokenize(input);
+    if tokens.is_empty() {
+        return Err(ParseError::Empty);
+    }
+
+    // 1. REL (`5m`, `30d`, `1d`, `1w`) — must validate min-interval, hence Result.
+    let rec = if let Some((p, end)) = try_recurring_relative(&tokens)? {
+        Some((p, end))
+    } else {
+        try_recurring_weekday(&tokens)
+            .or_else(|| try_recurring_day_of_month(&tokens))
+            .or_else(|| try_recurring_month_day(&tokens))
+    };
+
+    let (pattern, end_offset) = rec.ok_or(ParseError::NoTimeExpression)?;
+
+    let text = input[end_offset..].trim().to_string();
+    if text.is_empty() {
+        return Err(ParseError::MissingText);
+    }
+
+    let fire_at = pattern
+        .next_after(ctx.now_utc, ctx.tz)
+        .ok_or(ParseError::NoTimeExpression)?;
+
+    Ok(Parsed {
+        fire_at,
+        text,
+        had_explicit_time: false,
+        recurrence: Some(pattern),
+    })
+}
+
+/// Recurring REL → Interval (sub-day) or Weekly all-days (`*1d` daily).
+fn try_recurring_relative(
+    tokens: &[Token<'_>],
+) -> Result<Option<(RecurrencePattern, usize)>, ParseError> {
+    let Some((seconds, end_offset, _)) = parse_relative(tokens, false) else {
+        return Ok(None);
+    };
+
+    if seconds < MIN_INTERVAL_SECONDS {
+        return Err(ParseError::IntervalTooShort(MIN_INTERVAL_SECONDS));
+    }
+
+    let pattern = if seconds == 86_400 {
+        // Daily — DST-safe Weekly all-days at default time.
+        RecurrencePattern::Weekly {
+            days: ALL_WEEKDAYS.to_vec(),
+            time: DEFAULT_TIME,
+        }
+    } else {
+        RecurrencePattern::Interval { seconds }
+    };
+    Ok(Some((pattern, end_offset)))
+}
+
+/// `*do 14:00`, `*mo,mi,fr 9`, `*montag` → Weekly { days, time }.
+fn try_recurring_weekday(tokens: &[Token<'_>]) -> Option<(RecurrencePattern, usize)> {
+    let first = *tokens.first()?;
+    let days = match_weekday_list(first.0)?;
+    if days.is_empty() {
+        return None;
+    }
+
+    let (maybe_time, end_offset) =
+        consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
+    let time = maybe_time.unwrap_or(DEFAULT_TIME);
+
+    Some((RecurrencePattern::Weekly { days, time }, end_offset))
+}
+
+fn match_weekday_list(token: &str) -> Option<Vec<Weekday>> {
+    let mut out = Vec::new();
+    for part in token.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        match match_named_day(part) {
+            Some(NamedDay::Weekday(w)) => out.push(w),
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// `*1.` (just a day with trailing dot) → Monthly.
+fn try_recurring_day_of_month(tokens: &[Token<'_>]) -> Option<(RecurrencePattern, usize)> {
+    let first = *tokens.first()?;
+    let day = parse_day_of_month_token(first.0)?;
+
+    let (maybe_time, end_offset) =
+        consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
+    let time = maybe_time.unwrap_or(DEFAULT_TIME);
+
+    Some((RecurrencePattern::Monthly { day, time }, end_offset))
+}
+
+fn parse_day_of_month_token(s: &str) -> Option<u8> {
+    if !s.ends_with('.') {
+        return None;
+    }
+    let digits = &s[..s.len() - 1];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let day: u8 = digits.parse().ok()?;
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(day)
+}
+
+/// `*24.12` → Yearly Dec 24.
+fn try_recurring_month_day(tokens: &[Token<'_>]) -> Option<(RecurrencePattern, usize)> {
+    let first = *tokens.first()?;
+    let (day, month) = parse_month_day_token(first.0)?;
+
+    let (maybe_time, end_offset) =
+        consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
+    let time = maybe_time.unwrap_or(DEFAULT_TIME);
+
+    Some((RecurrencePattern::Yearly { month, day, time }, end_offset))
+}
+
+fn parse_month_day_token(s: &str) -> Option<(u8, u8)> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    if parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let day: u8 = parts[0].parse().ok()?;
+    let month: u8 = parts[1].parse().ok()?;
+    if !(1..=31).contains(&day) || !(1..=12).contains(&month) {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(2024, month as u32, day as u32)?; // sanity check
+    Some((day, month))
 }
 
 // ---------------------------------------------------------------------------
@@ -247,12 +446,11 @@ fn consume_optional_time(tokens: &[Token<'_>], from: usize) -> Option<(Option<Na
         i += 1;
     }
 
-    let clock_tok = tokens.get(i)?;
+    let clock_tok = *tokens.get(i)?;
     let time = parse_clock(clock_tok.0)?;
-    let mut end_offset = token_end(*clock_tok);
+    let mut end_offset = token_end(clock_tok);
     i += 1;
 
-    // Optional trailing "Uhr".
     if let Some(uhr) = tokens.get(i) {
         if is_uhr(uhr.0) {
             end_offset = token_end(*uhr);
@@ -268,9 +466,6 @@ fn parse_clock(s: &str) -> Option<NaiveTime> {
         let minute: u32 = m.parse().ok()?;
         return NaiveTime::from_hms_opt(hour, minute, 0);
     }
-    // Bare hour like `9` or `14`. We only accept this if it's all digits AND
-    // looks like a plausible hour — otherwise we'd consume reminder words by
-    // accident.
     if !s.chars().all(|c| c.is_ascii_digit()) || s.is_empty() || s.len() > 2 {
         return None;
     }

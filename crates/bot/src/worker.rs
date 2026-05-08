@@ -20,13 +20,19 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use botcore::Alert;
+use botcore::{Alert, Language, Recurrence};
 use storage::PgStore;
+
+use crate::messages as m;
+use crate::render;
 
 const MAX_ATTEMPTS: i16 = 5;
 const STALE_CLAIM_SECS: i64 = 60;
 const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const CLAIM_BATCH: i64 = 100;
+/// A delivery is "delayed" if it fires more than this far behind its
+/// scheduled time. Below this we treat it as normal latency.
+const DELAYED_THRESHOLD_SECS: i64 = 60;
 
 pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(store.pool()).await?;
@@ -71,15 +77,28 @@ async fn process_due(bot: &Bot, store: &PgStore) -> anyhow::Result<()> {
 }
 
 async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
-    let send = bot
-        .send_message(ChatId(alert.chat_id), &alert.text)
-        .send()
-        .await;
+    // Look up creator language for delay-prefix localisation. Failure to
+    // find the user is non-fatal — fall back to German (the bot's default).
+    let lang = match store.get_user(alert.user_id).await {
+        Ok(Some(u)) => u.language,
+        _ => Language::De,
+    };
+
+    let now = Utc::now();
+    let delay_secs = (now - alert.fire_at).num_seconds();
+    let body = if delay_secs > DELAYED_THRESHOLD_SECS {
+        let human = render::format_duration_human(delay_secs);
+        format!("{}{}", m::delayed_prefix(lang, &human), alert.text)
+    } else {
+        alert.text.clone()
+    };
+
+    let send = bot.send_message(ChatId(alert.chat_id), &body).send().await;
 
     match send {
         Ok(_) => {
-            if let Err(e) = store.mark_sent(alert.id).await {
-                error!(id = alert.id, error = ?e, "mark_sent failed");
+            if let Err(e) = finalise_after_send(store, &alert).await {
+                error!(id = alert.id, error = ?e, "finalise_after_send failed");
             }
         }
         Err(teloxide::RequestError::RetryAfter(seconds)) => {
@@ -118,6 +137,30 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
             }
         }
     }
+}
+
+/// On successful delivery: if recurring, compute the next fire time relative
+/// to *now* (skipping any missed occurrences during downtime so we don't fire
+/// the past N intervals back-to-back) and reschedule. Otherwise mark sent.
+async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<()> {
+    let Some(rec) = alert.recurrence.as_ref() else {
+        store.mark_sent(alert.id).await?;
+        return Ok(());
+    };
+
+    // Look up creator timezone so weekly/monthly/yearly resolve correctly.
+    let tz = store
+        .get_user(alert.user_id)
+        .await?
+        .map(|u| u.timezone)
+        .unwrap_or(chrono_tz::UTC);
+
+    let now = Utc::now();
+    match rec.next_after(now, tz) {
+        Some(next) => store.reschedule(alert.id, next).await?,
+        None => store.mark_sent(alert.id).await?,
+    }
+    Ok(())
 }
 
 async fn compute_next_wake(store: &PgStore) -> DateTime<Utc> {

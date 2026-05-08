@@ -59,10 +59,15 @@ pub fn help(lang: Language) -> &'static str {
             /cancel &lt;id&gt; — Reminder löschen\n\
             /tz &lt;zone&gt; — Zeitzone setzen (z.B. Europe/Berlin)\n\
             /lang de|en — Sprache umschalten\n\n\
-            <b>Zeitformate</b>\n\
+            <b>Einmalig</b>\n\
             • <code>5m</code>, <code>2h</code>, <code>30d</code>, <code>1w</code>\n\
             • <code>30.4.26</code> oder <code>30.04.2026 14:30</code>\n\
-            • <code>morgen 9 Uhr</code>, <code>do 14:00</code>, <code>übermorgen</code>",
+            • <code>morgen 9 Uhr</code>, <code>do 14:00</code>, <code>übermorgen</code>\n\n\
+            <b>Wiederkehrend</b> (Prefix <code>*</code> oder <code>jeden</code>/<code>alle</code>)\n\
+            • <code>*30m wasser</code>, <code>alle 2h pause</code>\n\
+            • <code>*1d vitamin</code>, <code>jeden tag 7 Uhr aufstehen</code>\n\
+            • <code>*do 14:00 standup</code>, <code>jeden mo,mi,fr 9 yoga</code>\n\
+            • <code>*1. miete</code>, <code>*24.12 heiligabend</code>",
         Language::En => "<b>Commands</b>\n\
             /alert &lt;time&gt; &lt;text&gt; — new reminder (private, only you can edit)\n\
             /galert &lt;time&gt; &lt;text&gt; — group reminder (anyone can edit)\n\
@@ -70,15 +75,28 @@ pub fn help(lang: Language) -> &'static str {
             /cancel &lt;id&gt; — delete a reminder\n\
             /tz &lt;zone&gt; — set timezone (e.g. Europe/Berlin)\n\
             /lang de|en — switch language\n\n\
-            <b>Time formats</b>\n\
+            <b>One-shot</b>\n\
             • <code>5m</code>, <code>2h</code>, <code>30d</code>, <code>1w</code>\n\
             • <code>30.4.26</code> or <code>30.04.2026 14:30</code>\n\
-            • <code>tomorrow 9</code>, <code>thu 14:00</code>",
+            • <code>tomorrow 9</code>, <code>thu 14:00</code>\n\n\
+            <b>Recurring</b> (prefix <code>*</code> or <code>every</code>)\n\
+            • <code>*30m water</code>, <code>every 2h break</code>\n\
+            • <code>*1d vitamin</code>, <code>every day 7am wake</code>\n\
+            • <code>*thu 14:00 standup</code>, <code>every mon,wed,fri 9 yoga</code>\n\
+            • <code>*1. rent</code>, <code>*24.12 christmas</code>",
     }
 }
 
-pub fn alert_confirmation(_lang: Language, when_short: &str, id: i64) -> String {
-    format!("✓ #{id} · {when_short}")
+pub fn alert_confirmation(
+    _lang: Language,
+    when_short: &str,
+    id: i64,
+    recurrence_short: Option<&str>,
+) -> String {
+    match recurrence_short {
+        Some(rec) => format!("✓ #{id} 🔁 · {when_short} · {rec}"),
+        None => format!("✓ #{id} · {when_short}"),
+    }
 }
 
 /// `creator_handle` is already HTML-escaped by the caller.
@@ -87,8 +105,12 @@ pub fn galert_confirmation(
     when_short: &str,
     id: i64,
     creator_handle: &str,
+    recurrence_short: Option<&str>,
 ) -> String {
-    format!("👥 #{id} · {when_short} · {creator_handle}")
+    match recurrence_short {
+        Some(rec) => format!("👥 #{id} 🔁 · {when_short} · {rec} · {creator_handle}"),
+        None => format!("👥 #{id} · {when_short} · {creator_handle}"),
+    }
 }
 
 pub fn cancelled_inline(_lang: Language, id: i64) -> String {
@@ -99,6 +121,16 @@ pub fn button_cancel(lang: Language) -> &'static str {
     match lang {
         Language::De => "✗ Löschen",
         Language::En => "✗ Cancel",
+    }
+}
+
+/// Prepended to a reminder when the worker delivered it noticeably late
+/// (typically because the bot was offline). `delay_human` is something like
+/// "5min", "2h", "1d 3h".
+pub fn delayed_prefix(lang: Language, delay_human: &str) -> String {
+    match lang {
+        Language::De => format!("⚠️ Verzögert um {delay_human} (Bot war offline)\n"),
+        Language::En => format!("⚠️ Delayed by {delay_human} (bot was offline)\n"),
     }
 }
 

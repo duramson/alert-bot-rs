@@ -22,7 +22,8 @@ use thiserror::Error;
 
 mod keywords;
 
-pub use botcore::Language;
+pub use botcore::recurrence::MIN_INTERVAL_SECONDS;
+pub use botcore::{Language, RecurrencePattern};
 
 /// Default time-of-day for named-day expressions without an explicit clock,
 /// e.g. `morgen Arzt` → tomorrow at 09:00 local time.
@@ -40,14 +41,16 @@ pub struct ParseContext {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Parsed {
-    /// Resolved fire time in UTC.
+    /// Resolved fire time in UTC. For recurring alerts, this is the *first*
+    /// occurrence — `recurrence` carries the rule for subsequent ones.
     pub fire_at: DateTime<Utc>,
     /// Reminder text — everything after the time expression, trimmed.
     pub text: String,
     /// `true` if the user gave an explicit clock time (e.g. `14:00`),
-    /// `false` if we filled in `DEFAULT_TIME`. Used by rendering to decide
-    /// whether to show the time component prominently.
+    /// `false` if we filled in `DEFAULT_TIME`.
     pub had_explicit_time: bool,
+    /// Some when the spec was recurring (`*`, `every`, `alle`, `jeden`, `jede`).
+    pub recurrence: Option<RecurrencePattern>,
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -64,6 +67,10 @@ pub enum ParseError {
     InvalidDate(String),
     #[error("invalid time: {0}")]
     InvalidTime(String),
+    #[error("recurring interval too short (minimum {0} seconds)")]
+    IntervalTooShort(i64),
+    #[error("this kind of spec can't recur")]
+    InvalidRecurrenceSpec,
 }
 
 mod grammar;
@@ -316,6 +323,173 @@ mod tests {
     #[test]
     fn err_no_time_expression() {
         let err = parse("hallo welt", &ctx(Language::De)).unwrap_err();
+        assert_eq!(err, ParseError::NoTimeExpression);
+    }
+
+    // ============================================================
+    // Recurring
+    // ============================================================
+
+    use chrono::{NaiveTime, Weekday};
+
+    fn nt(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn rec_short_interval_30m() {
+        let r = p("*30m wasser trinken");
+        assert_eq!(r.text, "wasser trinken");
+        assert_eq!(r.recurrence, Some(RecurrencePattern::Interval { seconds: 1800 }));
+        // First fire = now + 30min.
+        assert_eq!(
+            r.fire_at,
+            ctx(Language::De).now_utc + chrono::Duration::minutes(30)
+        );
+    }
+
+    #[test]
+    fn rec_long_interval_30m() {
+        let r = p("alle 30m wasser trinken");
+        assert_eq!(r.text, "wasser trinken");
+        assert_eq!(r.recurrence, Some(RecurrencePattern::Interval { seconds: 1800 }));
+    }
+
+    #[test]
+    fn rec_too_short() {
+        let err = parse("*5m wasser", &ctx(Language::De)).unwrap_err();
+        assert_eq!(err, ParseError::IntervalTooShort(1800));
+    }
+
+    #[test]
+    fn rec_daily_short() {
+        let r = p("*1d vitamin");
+        assert_eq!(r.text, "vitamin");
+        // Daily = Weekly all-days at default time
+        match r.recurrence.as_ref().unwrap() {
+            RecurrencePattern::Weekly { days, time } => {
+                assert_eq!(days.len(), 7);
+                assert_eq!(*time, nt(9, 0));
+            }
+            other => panic!("expected Weekly all-days, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rec_weekly_single_day_long() {
+        let r = p("jeden donnerstag 14:00 standup");
+        assert_eq!(r.text, "standup");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Weekly {
+                days: vec![Weekday::Thu],
+                time: nt(14, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_weekly_short_with_time() {
+        let r = p("*do 14:00 standup");
+        assert_eq!(r.text, "standup");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Weekly {
+                days: vec![Weekday::Thu],
+                time: nt(14, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_weekly_multi_day_with_comma() {
+        let r = p("*mo,mi,fr 9 yoga");
+        assert_eq!(r.text, "yoga");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Weekly {
+                days: vec![Weekday::Mon, Weekday::Wed, Weekday::Fri],
+                time: nt(9, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_weekly_default_time() {
+        let r = p("jeden montag yoga");
+        assert_eq!(r.text, "yoga");
+        match r.recurrence.as_ref().unwrap() {
+            RecurrencePattern::Weekly { days, time } => {
+                assert_eq!(days, &vec![Weekday::Mon]);
+                assert_eq!(*time, nt(9, 0));
+            }
+            other => panic!("expected Weekly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rec_monthly_first() {
+        let r = p("*1. miete bezahlen");
+        assert_eq!(r.text, "miete bezahlen");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Monthly {
+                day: 1,
+                time: nt(9, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_monthly_with_time() {
+        let r = p("jeden 15. 18:00 abrechnung");
+        assert_eq!(r.text, "abrechnung");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Monthly {
+                day: 15,
+                time: nt(18, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_yearly_short() {
+        let r = p("*24.12 heiligabend");
+        assert_eq!(r.text, "heiligabend");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Yearly {
+                month: 12,
+                day: 24,
+                time: nt(9, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_yearly_long_en() {
+        let r = p_en("every 24.12 christmas");
+        assert_eq!(r.text, "christmas");
+        assert_eq!(
+            r.recurrence,
+            Some(RecurrencePattern::Yearly {
+                month: 12,
+                day: 24,
+                time: nt(9, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn rec_missing_text() {
+        let err = parse("*30m", &ctx(Language::De)).unwrap_err();
+        assert_eq!(err, ParseError::MissingText);
+    }
+
+    #[test]
+    fn rec_no_recognised_spec_after_keyword() {
+        let err = parse("every gibberish", &ctx(Language::De)).unwrap_err();
         assert_eq!(err, ParseError::NoTimeExpression);
     }
 }
