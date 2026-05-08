@@ -22,6 +22,9 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
 
 - **Compact slash syntax** — `/alert 5m text`, `/alert 30d text`,
   `/alert 30.4.26 text`, `/alert morgen 9 Uhr text`, `/alert do 14:00 text`.
+- **Recurring** — `*` prefix or `every`/`alle`/`jeden`. `*30m water`,
+  `*1d vitamin`, `*do 14:00 standup`, `*mo,mi,fr 9 yoga`, `*1. rent`,
+  `*24.12 christmas`. Minimum interval 30 minutes.
 - **DE + EN parser** — keywords (`heute`/`today`, `morgen`/`tomorrow`, weekdays,
   `Uhr`, time units) accept both languages and tolerate typos via Levenshtein
   distance with adaptive thresholds.
@@ -126,10 +129,11 @@ async or I/O dependencies, so `cargo fuzz` can run against it directly.
 
 ## Roadmap
 
-- **Recurring alerts** (`/alert every monday 9:00 standup`). Schema and
-  serialization are in place; parser and worker re-schedule logic land in v0.2.
-- **`/edit`** flow — left out of v0.1 because the Force-Reply UX
-  felt clumsier than just cancelling and recreating.
+- **Planned maintenance windows** — schedule a downtime; alerts that would
+  fire inside it get a heads-up notification before and/or after, instead of
+  the catch-up-with-delay-note behaviour the worker uses for unplanned outages.
+- **`/edit`** flow — left out of v0.1 because the Force-Reply UX felt clumsier
+  than cancelling and recreating.
 - **Per-chat rate limiting** via `governor` (already a dependency) for groups
   with bursty alert traffic.
 - **Encrypted alert text at rest** if a real threat model shows up.

@@ -138,6 +138,9 @@ const TIME_UNIT_TABLE: &[(TimeUnit, &[&str])] = &[
 const UHR_ALIASES: &[&str] = &["uhr", "o'clock", "oclock"];
 const IN_ALIASES: &[&str] = &["in"];
 const AT_ALIASES: &[&str] = &["um", "at"];
+/// Recurring trigger words. Exact match only (case-insensitive) — fuzzy match
+/// would risk swallowing reminder words like "alle" used as plural.
+const RECURRING_KEYWORDS: &[&str] = &["every", "alle", "jeden", "jede"];
 
 pub fn match_named_day(token: &str) -> Option<NamedDay> {
     let lower = token.to_lowercase();
@@ -165,6 +168,11 @@ pub fn is_in_prefix(token: &str) -> bool {
 pub fn is_at_prefix(token: &str) -> bool {
     let lower = token.to_lowercase();
     AT_ALIASES.iter().any(|a| lower == *a)
+}
+
+pub fn is_recurring_keyword(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    RECURRING_KEYWORDS.iter().any(|a| lower == *a)
 }
 
 #[cfg(test)]

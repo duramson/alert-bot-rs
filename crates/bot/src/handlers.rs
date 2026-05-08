@@ -101,13 +101,18 @@ async fn create_alert(
         scope,
         text: parsed.text.clone(),
         fire_at: parsed.fire_at,
-        recurrence: None,
+        recurrence: parsed.recurrence.clone(),
     };
     let alert = store.create_alert(new).await?;
 
     let when = render::format_local_short(alert.fire_at, user.timezone, user.language);
+    let recurrence_short = alert
+        .recurrence
+        .as_ref()
+        .map(|r| render::format_recurrence_short(r, user.language));
+    let recurrence_str = recurrence_short.as_deref();
     let reply = match scope {
-        AlertScope::Private => m::alert_confirmation(user.language, &when, alert.id),
+        AlertScope::Private => m::alert_confirmation(user.language, &when, alert.id, recurrence_str),
         AlertScope::Shared => {
             let handle = msg
                 .from
@@ -120,7 +125,13 @@ async fn create_alert(
                         .map(|u| u.first_name.clone())
                         .unwrap_or_default()
                 });
-            m::galert_confirmation(user.language, &when, alert.id, &html_escape(&handle))
+            m::galert_confirmation(
+                user.language,
+                &when,
+                alert.id,
+                &html_escape(&handle),
+                recurrence_str,
+            )
         }
     };
 
@@ -172,13 +183,20 @@ async fn list(
     let mut out = String::from(m::list_header(lang));
     out.push('\n');
     for a in &alerts {
-        let icon = match a.scope {
+        let scope_icon = match a.scope {
             AlertScope::Private => "🔒",
             AlertScope::Shared => "👥",
         };
         let when = render::format_local_compact(a.fire_at, tz, lang);
         let text = html_escape(&a.text);
-        out.push_str(&format!("\n{icon} #{} · {when} · {text}", a.id));
+        let line = match a.recurrence.as_ref() {
+            Some(rec) => {
+                let rec_short = render::format_recurrence_short(rec, lang);
+                format!("\n{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
+            }
+            None => format!("\n{scope_icon} #{} · {when} · {text}", a.id),
+        };
+        out.push_str(&line);
     }
 
     bot.send_message(msg.chat.id, out)
