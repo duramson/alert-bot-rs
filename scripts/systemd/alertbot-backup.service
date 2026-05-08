@@ -1,0 +1,11 @@
+[Unit]
+Description=alert-bot Postgres backup → Netcup SFTP
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/alertbot-backup.env
+ExecStart=/usr/local/bin/alertbot-backup.sh
+StandardOutput=journal
+StandardError=journal

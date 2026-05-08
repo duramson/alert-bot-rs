@@ -13,22 +13,22 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
         Language::De => vec![
             ("start", "begrüßt dich und richtet dein Profil ein"),
             ("help", "zeigt alle Befehle und Beispiele"),
-            ("alert", "neuer Reminder, privat — nur du kannst ihn editieren"),
-            ("galert", "Gruppen-Reminder — jeder im Chat kann ihn editieren"),
+            ("alert", "Reminder — nur du kannst ihn löschen (DM und Gruppen)"),
+            ("galert", "Gruppen-Reminder — jeder im Chat kann ihn löschen"),
             ("list", "listet aktive Reminder im aktuellen Chat"),
             ("cancel", "löscht einen Reminder per ID"),
             ("tz", "setzt deine Zeitzone, z.B. Europe/Berlin"),
-            ("lang", "wechselt die Sprache: de oder en"),
+            ("lang", "wechselt die Sprache (de oder en)"),
         ],
         Language::En => vec![
             ("start", "say hi and set up your profile"),
             ("help", "show all commands and examples"),
-            ("alert", "new reminder, private — only you can edit it"),
-            ("galert", "group reminder — anyone in the chat can edit it"),
+            ("alert", "reminder — only you can cancel it (DMs and groups)"),
+            ("galert", "group reminder — anyone in the chat can cancel it"),
             ("list", "show active reminders in the current chat"),
             ("cancel", "delete a reminder by id"),
             ("tz", "set your timezone, e.g. Europe/Berlin"),
-            ("lang", "switch language: de or en"),
+            ("lang", "switch language (de or en)"),
         ],
     }
 }
@@ -36,80 +36,92 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
 pub fn welcome(lang: Language) -> &'static str {
     match lang {
         Language::De => "Hi! Ich bin dein Alert-Bot. Schick mir z.B.\n\
-            <code>/alert 5m Kaffee fertig</code>\n\
-            <code>/alert 30.4.26 Steuererklärung</code>\n\
-            <code>/alert do 14:00 Standup</code>\n\n\
-            In Gruppen: <code>/galert</code> für gemeinsame Reminder.\n\
-            <code>/help</code> zeigt alle Befehle.",
+            /alert 5m Kaffee fertig\n\
+            /alert 30.4.26 Steuererklärung\n\
+            /alert do 14:00 Standup\n\n\
+            In Gruppen funktionieren beide: /alert für deine eigenen Reminder, \
+            /galert wenn ihn jeder verwalten können soll.\n\
+            /help zeigt alle Befehle.",
         Language::En => "Hi! I'm your alert bot. Try messages like\n\
-            <code>/alert 5m coffee ready</code>\n\
-            <code>/alert 30.4.26 file taxes</code>\n\
-            <code>/alert thu 14:00 standup</code>\n\n\
-            In groups: <code>/galert</code> for shared reminders.\n\
-            <code>/help</code> lists every command.",
+            /alert 5m coffee ready\n\
+            /alert 30.4.26 file taxes\n\
+            /alert thu 14:00 standup\n\n\
+            Both work in groups: /alert for your own reminders, /galert when \
+            anyone in the chat should be able to manage it.\n\
+            /help lists every command.",
     }
 }
 
 pub fn help(lang: Language) -> &'static str {
     match lang {
         Language::De => "<b>Befehle</b>\n\
-            /alert &lt;zeit&gt; &lt;text&gt; — neuer Reminder (privat, nur du editierst)\n\
-            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder (jeder editiert)\n\
+            /alert &lt;zeit&gt; &lt;text&gt; — Reminder. Nur du kannst ihn löschen. Funktioniert im Privatchat und in Gruppen.\n\
+            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder, jeder im Chat kann ihn löschen. Nur in Gruppen.\n\
             /list — aktive Reminder anzeigen\n\
             /cancel &lt;id&gt; — Reminder löschen\n\
             /tz &lt;zone&gt; — Zeitzone setzen (z.B. Europe/Berlin)\n\
-            /lang de|en — Sprache umschalten\n\n\
+            /lang &lt;de oder en&gt; — Sprache umschalten\n\n\
             <b>Einmalig</b>\n\
-            • <code>5m</code>, <code>2h</code>, <code>30d</code>, <code>1w</code>\n\
-            • <code>30.4.26</code> oder <code>30.04.2026 14:30</code>\n\
-            • <code>morgen 9 Uhr</code>, <code>do 14:00</code>, <code>übermorgen</code>\n\n\
-            <b>Wiederkehrend</b> (Prefix <code>*</code> oder <code>jeden</code>/<code>alle</code>)\n\
-            • <code>*30m wasser</code>, <code>alle 2h pause</code>\n\
-            • <code>*1d vitamin</code>, <code>jeden tag 7 Uhr aufstehen</code>\n\
-            • <code>*do 14:00 standup</code>, <code>jeden mo,mi,fr 9 yoga</code>\n\
-            • <code>*1. miete</code>, <code>*24.12 heiligabend</code>",
+            • 5m, 2h, 30d, 1w\n\
+            • 30.4.26 oder 30.04.2026 14:30\n\
+            • morgen 9 Uhr, do 14:00, übermorgen\n\n\
+            <b>Wiederkehrend</b> (Prefix * oder jeden/alle)\n\
+            • *30m wasser, alle 2h pause\n\
+            • *1d vitamin, jeden tag 7 Uhr aufstehen\n\
+            • *do 14:00 standup, jeden mo,mi,fr 9 yoga\n\
+            • *1. miete, *24.12 heiligabend",
         Language::En => "<b>Commands</b>\n\
-            /alert &lt;time&gt; &lt;text&gt; — new reminder (private, only you can edit)\n\
-            /galert &lt;time&gt; &lt;text&gt; — group reminder (anyone can edit)\n\
+            /alert &lt;time&gt; &lt;text&gt; — reminder. Only you can cancel it. Works in DMs and groups.\n\
+            /galert &lt;time&gt; &lt;text&gt; — group reminder, anyone in the chat can cancel it. Groups only.\n\
             /list — show active reminders\n\
             /cancel &lt;id&gt; — delete a reminder\n\
             /tz &lt;zone&gt; — set timezone (e.g. Europe/Berlin)\n\
-            /lang de|en — switch language\n\n\
+            /lang &lt;de or en&gt; — switch language\n\n\
             <b>One-shot</b>\n\
-            • <code>5m</code>, <code>2h</code>, <code>30d</code>, <code>1w</code>\n\
-            • <code>30.4.26</code> or <code>30.04.2026 14:30</code>\n\
-            • <code>tomorrow 9</code>, <code>thu 14:00</code>\n\n\
-            <b>Recurring</b> (prefix <code>*</code> or <code>every</code>)\n\
-            • <code>*30m water</code>, <code>every 2h break</code>\n\
-            • <code>*1d vitamin</code>, <code>every day 7am wake</code>\n\
-            • <code>*thu 14:00 standup</code>, <code>every mon,wed,fri 9 yoga</code>\n\
-            • <code>*1. rent</code>, <code>*24.12 christmas</code>",
+            • 5m, 2h, 30d, 1w\n\
+            • 30.4.26 or 30.04.2026 14:30\n\
+            • tomorrow 9, thu 14:00\n\n\
+            <b>Recurring</b> (prefix * or every)\n\
+            • *30m water, every 2h break\n\
+            • *1d vitamin, every day 7am wake\n\
+            • *thu 14:00 standup, every mon,wed,fri 9 yoga\n\
+            • *1. rent, *24.12 christmas",
     }
 }
 
 pub fn alert_confirmation(
-    _lang: Language,
+    lang: Language,
     when_short: &str,
     id: i64,
     recurrence_short: Option<&str>,
 ) -> String {
+    let verb = match lang {
+        Language::De => "Gespeichert",
+        Language::En => "Saved",
+    };
     match recurrence_short {
-        Some(rec) => format!("✓ #{id} 🔁 · {when_short} · {rec}"),
-        None => format!("✓ #{id} · {when_short}"),
+        Some(rec) => format!("✓ {verb} · #{id} 🔁 · {when_short} · {rec}"),
+        None => format!("✓ {verb} · #{id} · {when_short}"),
     }
 }
 
 /// `creator_handle` is already HTML-escaped by the caller.
 pub fn galert_confirmation(
-    _lang: Language,
+    lang: Language,
     when_short: &str,
     id: i64,
     creator_handle: &str,
     recurrence_short: Option<&str>,
 ) -> String {
+    let (verb, by) = match lang {
+        Language::De => ("Gespeichert", "von"),
+        Language::En => ("Saved", "by"),
+    };
     match recurrence_short {
-        Some(rec) => format!("👥 #{id} 🔁 · {when_short} · {rec} · {creator_handle}"),
-        None => format!("👥 #{id} · {when_short} · {creator_handle}"),
+        Some(rec) => format!(
+            "👥 {verb} · #{id} 🔁 · {when_short} · {rec} · {by} {creator_handle}"
+        ),
+        None => format!("👥 {verb} · #{id} · {when_short} · {by} {creator_handle}"),
     }
 }
 
@@ -136,8 +148,8 @@ pub fn delayed_prefix(lang: Language, delay_human: &str) -> String {
 
 pub fn nudge_to_help(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Probier <code>/alert 5m text</code> oder <code>/help</code>.",
-        Language::En => "Try <code>/alert 5m text</code> or <code>/help</code>.",
+        Language::De => "Probier /alert 5m text oder /help.",
+        Language::En => "Try /alert 5m text or /help.",
     }
 }
 
@@ -150,8 +162,8 @@ pub fn callback_cancelled(lang: Language) -> &'static str {
 
 pub fn parse_error_unknown(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Konnte die Zeit nicht erkennen. <code>/help</code> zeigt Beispiele.",
-        Language::En => "Couldn't parse the time. Try <code>/help</code> for examples.",
+        Language::De => "Konnte die Zeit nicht erkennen. /help zeigt Beispiele.",
+        Language::En => "Couldn't parse the time. Try /help for examples.",
     }
 }
 
@@ -164,8 +176,8 @@ pub fn parse_error_in_past(lang: Language) -> &'static str {
 
 pub fn parse_error_missing_text(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Was soll dich denn erinnern? Beispiel: <code>/alert 5m Kaffee</code>",
-        Language::En => "Reminder text missing. Example: <code>/alert 5m coffee</code>",
+        Language::De => "Was soll dich denn erinnern? Beispiel: /alert 5m Kaffee",
+        Language::En => "Reminder text missing. Example: /alert 5m coffee",
     }
 }
 
@@ -206,8 +218,8 @@ pub fn cancel_not_found(lang: Language) -> &'static str {
 
 pub fn galert_dm_rejected(lang: Language) -> &'static str {
     match lang {
-        Language::De => "<code>/galert</code> funktioniert nur in Gruppen. Im Privatchat nimm <code>/alert</code>.",
-        Language::En => "<code>/galert</code> only works in groups. In DMs use <code>/alert</code>.",
+        Language::De => "/galert funktioniert nur in Gruppen. Im Privatchat nimm /alert.",
+        Language::En => "/galert only works in groups. In DMs use /alert.",
     }
 }
 
@@ -220,8 +232,8 @@ pub fn tz_set(lang: Language, tz: &str) -> String {
 
 pub fn tz_invalid(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Unbekannte Zeitzone. Beispiel: <code>/tz Europe/Berlin</code>",
-        Language::En => "Unknown timezone. Example: <code>/tz Europe/Berlin</code>",
+        Language::De => "Unbekannte Zeitzone. Beispiel: /tz Europe/Berlin",
+        Language::En => "Unknown timezone. Example: /tz Europe/Berlin",
     }
 }
 
@@ -234,7 +246,7 @@ pub fn lang_set(lang: Language) -> &'static str {
 
 pub fn lang_invalid(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Verfügbare Sprachen: <code>de</code>, <code>en</code>",
-        Language::En => "Available languages: <code>de</code>, <code>en</code>",
+        Language::De => "Verfügbare Sprachen: de, en",
+        Language::En => "Available languages: de, en",
     }
 }

@@ -84,6 +84,7 @@ The `cloudflared` service is gated behind the `tunnel` profile and exposes the w
 - **Default language is German** (`Language::from_telegram_code` falls back to `De`). User-facing strings in `bot/messages.rs` are keyed off `Language` with plain functions, not Fluent.
 - **Times in DB are always UTC** (`TIMESTAMPTZ`). Conversion to/from the user's `Tz` happens in `parser::local_to_utc` (DST-aware: ambiguous → earlier, gap → bump forward) and `bot/render.rs`.
 - **Telegram HTML parse mode** is used for confirmation/help replies — escape user-controlled strings via the `html_escape` helper in `bot/handlers.rs` when interpolating into messages.
+- **No `<code>` or `<pre>` tags in user-facing Telegram strings.** Telegram renders monospace fonts much larger than the surrounding body text, which looks broken on mobile. Use `<b>`, `<i>`, and plain text only. This applies to every string sent to Telegram — replies, help text, error messages, admin notifications. Inline command examples should be plain (`/alert 5m text`), not wrapped in `<code>`.
 - **Multi-instance is supported** by design (`SKIP LOCKED` claim + idempotent `processed_updates`), but Telegram only delivers updates to one webhook — to actually run >1 replica you'd need a load-balancer in front of the webhook port.
 
 <!-- gitnexus:start -->

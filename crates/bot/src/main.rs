@@ -13,13 +13,17 @@ use url::Url;
 
 use storage::PgStore;
 
+mod admin;
 mod commands;
 mod handlers;
 mod messages;
 mod render;
 mod worker;
 
+use admin::AdminNotifier;
 use commands::Command;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,8 +40,19 @@ async fn main() -> Result<()> {
     let bot = Bot::new(&config.bot_token);
     register_command_menus(&bot).await;
 
+    let notifier = AdminNotifier::new(bot.clone(), config.admin_chat_id);
+    let transport_label = match config.transport {
+        Transport::Webhook { .. } => "webhook",
+        Transport::Polling => "polling",
+    };
+    notifier
+        .notify(&format!(
+            "✅ <b>alert-bot v{VERSION}</b> gestartet · transport={transport_label}"
+        ))
+        .await;
+
     let shutdown = Arc::new(Notify::new());
-    spawn_signal_handler(shutdown.clone());
+    spawn_signal_handler(shutdown.clone(), notifier.clone());
 
     let worker_handle = {
         let bot = bot.clone();
@@ -87,7 +102,20 @@ async fn main() -> Result<()> {
     }
 
     shutdown.notify_waiters();
-    let _ = worker_handle.await;
+    match worker_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            notifier
+                .notify(&format!("💥 <b>worker exited with error</b>\n{e}"))
+                .await;
+        }
+        Err(join_err) => {
+            notifier
+                .notify(&format!("💥 <b>worker panicked</b>\n{join_err}"))
+                .await;
+        }
+    }
+    notifier.notify("🛑 alert-bot stopped").await;
     Ok(())
 }
 
@@ -100,6 +128,7 @@ struct Config {
     bot_token: String,
     database_url: String,
     transport: Transport,
+    admin_chat_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -130,10 +159,19 @@ impl Config {
             }
         };
 
+        let admin_chat_id = match std::env::var("ADMIN_CHAT_ID").ok().filter(|s| !s.is_empty()) {
+            None => None,
+            Some(s) => Some(
+                s.parse::<i64>()
+                    .context("ADMIN_CHAT_ID must be a numeric Telegram chat id")?,
+            ),
+        };
+
         Ok(Self {
             bot_token,
             database_url,
             transport,
+            admin_chat_id,
         })
     }
 }
@@ -176,7 +214,7 @@ async fn register_command_menus(bot: &Bot) {
     }
 }
 
-fn spawn_signal_handler(shutdown: Arc<Notify>) {
+fn spawn_signal_handler(shutdown: Arc<Notify>, notifier: AdminNotifier) {
     tokio::spawn(async move {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
@@ -192,10 +230,14 @@ fn spawn_signal_handler(shutdown: Arc<Notify>) {
                 return;
             }
         };
-        tokio::select! {
-            _ = term.recv() => info!("SIGTERM received"),
-            _ = int.recv() => info!("SIGINT received"),
-        }
+        let signal_name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        info!("{signal_name} received");
+        notifier
+            .notify(&format!("🛑 {signal_name} received, shutting down"))
+            .await;
         shutdown.notify_waiters();
     });
 }
