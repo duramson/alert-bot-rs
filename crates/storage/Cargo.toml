@@ -1,0 +1,19 @@
+[package]
+name = "alert-bot-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "storage"
+
+[dependencies]
+botcore.workspace = true
+
+chrono.workspace = true
+chrono-tz.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
