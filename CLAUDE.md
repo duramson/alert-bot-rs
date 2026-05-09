@@ -76,6 +76,24 @@ docker compose logs -f bot
 
 The `cloudflared` service is gated behind the `tunnel` profile and exposes the webhook port via Cloudflare Tunnel; `WEBHOOK_URL` in `.env` must point at the Cloudflare hostname.
 
+## Production deployment
+
+The live instance runs on a Proxmox-hosted Debian-12 LXC (created via the community-scripts `docker.sh` helper). Inside the LXC: `docker compose` brings up the bot + Postgres on the same network; nothing is exposed to the LAN. A Cloudflare Tunnel (running outside this compose, owned by the Futro setup) routes a public hostname to `<lxc-ip>:8080` so Telegram can hit the webhook. The repo lives at `/opt/alert-bot-rs` on the LXC.
+
+Off-site backups: `scripts/backup-postgres.sh` runs nightly via a systemd timer (`alertbot-backup.timer` → 03:30 UTC), streaming `pg_dump | gzip | SFTP` straight to a Netcup webhosting target. Config in `/etc/alertbot-backup.env` (chmod 600). Retention: 30 days, enforced by the script itself (lists remote files, deletes anything older than `RETENTION_DAYS`).
+
+## Update workflow
+
+Single-command deploy from the dev machine: `./scripts/deploy.sh`. Pipeline:
+1. `cargo test --workspace` (skippable with `--no-test`)
+2. `git push`
+3. SSH into the LXC → `git pull --ff-only` → `docker compose up -d --build`
+4. Tails bot logs for 30 s so we see startup output
+
+Required env on the dev machine: `LXC_HOST` (default `root@10.0.70.240`), `REPO_PATH` (default `/opt/alert-bot-rs`). Best parked in `~/.zshrc` or a per-project `.env.local` that's gitignored.
+
+`scripts/logs.sh [service] [tail]` is the quick remote tail. For rollbacks: `git reset --hard <sha>` on the LXC and `docker compose up -d --build` again — Postgres volume survives container rebuilds, so code-only rollbacks are safe without a restore. Schema rollbacks need a Netcup-backup restore.
+
 ## Conventions worth knowing
 
 - **`sqlx::query` not `query!`.** The workspace deliberately avoids compile-time-checked queries so it builds without a live DB. If migrating to `query!`, also add a `.sqlx/` offline cache and CI step to refresh it.
