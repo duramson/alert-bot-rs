@@ -59,41 +59,193 @@ needed. Open Telegram, message your bot, send `/start`.
 | Variable             | Required | Default              | Notes                                                    |
 |----------------------|----------|----------------------|----------------------------------------------------------|
 | `BOT_TOKEN`          | yes      | —                    | from [@BotFather](https://t.me/BotFather)                |
-| `POSTGRES_PASSWORD`  | yes      | —                    | also set in compose                                       |
+| `POSTGRES_PASSWORD`  | yes      | —                    | also set in compose                                      |
 | `POSTGRES_USER`      | no       | `alertbot`           |                                                          |
 | `POSTGRES_DB`        | no       | `alertbot`           |                                                          |
+| `ADMIN_CHAT_ID`      | no       | empty                | Telegram chat id that gets ops notifications (start, stop, worker errors) |
 | `WEBHOOK_URL`        | no       | empty (long-polling) | public HTTPS URL Telegram will POST to                   |
 | `WEBHOOK_LISTEN`     | no       | `0.0.0.0:8080`       | bind address inside the container                        |
 | `WEBHOOK_SECRET`     | no       | empty                | recommended; sent as `X-Telegram-Bot-Api-Secret-Token`   |
 | `CLOUDFLARED_TOKEN`  | no       | empty                | only needed for the `tunnel` profile                     |
 | `RUST_LOG`           | no       | `info,alert_bot=debug` |                                                       |
 
-## Deployment
+## Production deployment (Proxmox LXC + Cloudflare Tunnel)
 
-### Local / Mac mini / homelab with Cloudflare Tunnel
+This is how the live instance runs. Topology:
 
-The compose file ships an optional `cloudflared` service behind the `tunnel`
-profile. It exposes the bot to the public internet through Cloudflare without
-opening any ports on the host.
+```
+Telegram  ──HTTPS──►  Cloudflare edge  ──tunnel──►  cloudflared (LXC)
+                                                         │
+                                                  http   ▼
+                                                  ┌──────────────┐
+                                                  │ Docker LXC   │
+                                                  │              │
+                                                  │   bot ◄──► postgres
+                                                  └──────────────┘
+                                                         │
+                                                       SFTP nightly
+                                                         ▼
+                                                  Netcup webhosting (off-site dumps)
+```
 
-1. Create a tunnel in the Cloudflare Zero Trust dashboard.
-2. Add a public hostname route → service `http://bot:8080`.
-3. Copy the tunnel token into `.env` as `CLOUDFLARED_TOKEN`.
-4. Set `WEBHOOK_URL` to the public hostname and pick a random
-   `WEBHOOK_SECRET` (`openssl rand -hex 32`).
-5. `docker compose --profile tunnel up -d --build`.
+### One-time setup
 
-### VPS
+#### 1. Create the LXC
 
-Any host with TLS works. Point `WEBHOOK_URL` at your domain, run a reverse
-proxy (caddy, nginx, traefik) terminating TLS in front of the bot's `:8080`,
-keep the database on the same host or in the same private network.
+On the Proxmox host:
 
-### Switching deployments
+```bash
+bash -c "$(wget -qLO - https://github.com/community-scripts/ProxmoxVE/raw/main/ct/docker.sh)"
+```
 
-Telegram knows only the webhook URL. Migrating between hosts is one
-`setWebhook` call (the bot does this automatically on boot from `WEBHOOK_URL`)
-plus a `pg_dump` / `pg_restore` for the database.
+Choose Debian-12 unprivileged, defaults are fine (2 CPU / 2 GB / 8 GB disk),
+nesting + keyctl + fuse get configured, Docker + compose-v2 preinstalled.
+
+Note the LXC's IP — it shows at the end of the script.
+
+#### 2. Clone the repo + configure env
+
+```bash
+ssh root@<lxc-ip>
+gh auth login                                  # or git clone with HTTPS PAT
+gh repo clone <you>/alert-bot-rs /opt/alert-bot-rs
+cd /opt/alert-bot-rs
+cp .env.example .env
+nano .env
+# Set: BOT_TOKEN, POSTGRES_PASSWORD, ADMIN_CHAT_ID
+# Leave WEBHOOK_URL/WEBHOOK_SECRET empty for now (we test polling first)
+```
+
+#### 3. Bring up Postgres + bot in long-polling for sanity
+
+```bash
+docker compose up -d
+docker compose logs -f bot
+```
+
+You should see `transport=polling` in the startup line and get a
+`✅ alert-bot started` Telegram message in your DM (if `ADMIN_CHAT_ID` set).
+
+#### 4. Migrate data from the old host (skip if starting fresh)
+
+On the source machine:
+
+```bash
+docker compose stop bot
+docker compose exec -T postgres \
+    pg_dump -U alertbot --clean --if-exists alertbot > alertbot.sql
+scp alertbot.sql root@<lxc-ip>:/opt/alert-bot-rs/
+```
+
+On the LXC:
+
+```bash
+docker compose exec -T postgres psql -U alertbot -d alertbot < alertbot.sql
+docker compose exec postgres psql -U alertbot -d alertbot \
+    -c "SELECT count(*), max(created_at) FROM alerts;"
+docker compose restart bot
+```
+
+#### 5. Cloudflare Tunnel route + webhook switch
+
+In the Cloudflare Zero Trust dashboard:
+- Tunnel → Public Hostnames → Add
+- Subdomain: `alert` (or any), domain: yours
+- Service: HTTP, URL: `<lxc-ip>:8080`
+
+Then on the LXC:
+
+```bash
+nano .env
+# WEBHOOK_URL=https://alert.yourdomain.de/webhook
+# WEBHOOK_SECRET=$(openssl rand -hex 32)
+docker compose up -d --force-recreate bot
+
+# verify
+source .env
+curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo" | jq
+```
+
+`url` should match your Cloudflare hostname, `pending_update_count` should be 0.
+
+#### 6. Nightly off-site backup → Netcup SFTP
+
+```bash
+apt install -y curl sshpass
+cp scripts/backup-postgres.sh /usr/local/bin/alertbot-backup.sh
+cp scripts/systemd/alertbot-backup.{service,timer} /etc/systemd/system/
+nano /etc/alertbot-backup.env
+# COMPOSE_DIR=/opt/alert-bot-rs
+# BACKUP_NETCUP_HOST=...
+# BACKUP_NETCUP_USER=...
+# BACKUP_NETCUP_PASS=...
+# BACKUP_NETCUP_PATH=backups/alertbot
+# RETENTION_DAYS=30
+chmod 600 /etc/alertbot-backup.env
+systemctl daemon-reload
+systemctl enable --now alertbot-backup.timer
+systemctl start alertbot-backup.service        # test now
+journalctl -u alertbot-backup -n 30
+```
+
+Daily at 03:30 UTC the timer streams a gzipped dump to Netcup. Old files
+(>30 days) get cleaned up automatically.
+
+### Restoring from backup
+
+```bash
+docker compose up -d postgres
+curl --user "$BACKUP_NETCUP_USER:$BACKUP_NETCUP_PASS" \
+    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.sql.gz" \
+  | gunzip \
+  | docker compose exec -T postgres psql -U alertbot -d alertbot
+docker compose up -d bot
+```
+
+`pg_dump --clean --if-exists` makes the restore idempotent — it drops and
+recreates objects, so running it on a non-empty DB is safe.
+
+## Update workflow
+
+Local dev → push → LXC pulls + rebuilds. Single command from the dev machine:
+
+```bash
+./scripts/deploy.sh
+```
+
+What it does:
+1. Runs `cargo test --workspace` (skip with `--no-test` for hotfixes)
+2. `git push`
+3. SSH into the LXC, `git pull --ff-only`, `docker compose up -d --build`
+4. Tails bot logs for 30s so you see the startup / catch errors live
+
+Config via env (export in your shell or `.env.local`):
+
+```bash
+export LXC_HOST=root@10.0.70.240
+export REPO_PATH=/opt/alert-bot-rs
+```
+
+Other helpers:
+
+```bash
+./scripts/logs.sh           # tail bot logs (or pass another service: postgres)
+./scripts/logs.sh bot 200   # last 200 lines + follow
+```
+
+### Rollback
+
+```bash
+ssh root@<lxc-ip>
+cd /opt/alert-bot-rs
+git log --oneline | head        # find the commit you want to go back to
+git reset --hard <sha>
+docker compose up -d --build
+```
+
+The Postgres data isn't touched by container rebuilds (separate volume), so
+this is safe for any code-only rollback. For schema rollbacks you'd restore
+from a `pg_dump` — keep your daily Netcup backups close.
 
 ## Architecture
 
