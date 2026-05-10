@@ -78,21 +78,19 @@ The `cloudflared` service is gated behind the `tunnel` profile and exposes the w
 
 ## Production deployment
 
-The live instance runs on a Proxmox-hosted Debian-12 LXC (created via the community-scripts `docker.sh` helper). Inside the LXC: `docker compose` brings up the bot + Postgres on the same network; nothing is exposed to the LAN. A Cloudflare Tunnel (running outside this compose, owned by the Futro setup) routes a public hostname to `<lxc-ip>:8080` so Telegram can hit the webhook. The repo lives at `/opt/alert-bot-rs` on the LXC.
+The live instance runs on a Proxmox-hosted Debian-12 LXC (created via the community-scripts `docker.sh` helper). `docker compose` brings up the bot + Postgres; the bot publishes `:8080` on the LXC's host network (Postgres stays internal). A separate cloudflared LXC on the same Proxmox host fronts a Cloudflare Tunnel that routes a public hostname to `<bot-lxc-ip>:8080` so Telegram can POST webhooks. The repo lives at `/opt/alert-bot-rs` on the bot LXC.
 
 Off-site backups: `scripts/backup-postgres.sh` runs nightly via a systemd timer (`alertbot-backup.timer` → 03:30 UTC), streaming `pg_dump | gzip | SFTP` straight to a Netcup webhosting target. Config in `/etc/alertbot-backup.env` (chmod 600). Retention: 30 days, enforced by the script itself (lists remote files, deletes anything older than `RETENTION_DAYS`).
 
 ## Update workflow
 
-Single-command deploy from the dev machine: `./scripts/deploy.sh`. Pipeline:
-1. `cargo test --workspace` (skippable with `--no-test`)
-2. `git push`
-3. SSH into the LXC → `git pull --ff-only` → `docker compose up -d --build`
-4. Tails bot logs for 30 s so we see startup output
+Two coexisting paths:
 
-Required env on the dev machine: `LXC_HOST` (default `root@10.0.70.240`), `REPO_PATH` (default `/opt/alert-bot-rs`). Best parked in `~/.zshrc` or a per-project `.env.local` that's gitignored.
+**CI/CD (preferred for production)** — `.github/workflows/deploy.yml`. On push to `main`: `cargo test`, build the image with `docker buildx`, push to `ghcr.io/<you>/alert-bot-rs:{latest, sha-XXXXX}`, then SSH into the LXC via Cloudflare Access SSH (no public SSH port) and run `git pull && docker compose pull bot && docker compose up -d`. Required GH secrets: `LXC_SSH_KEY`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`. GH variables: `SSH_HOST`, `SSH_USER`. The LXC must have `COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml` in its `.env` so compose layers the prod override (which swaps the local `build:` for `image: ghcr.io/...`). Compose's auto-loading of `.env` picks this up — no `-f` flags needed. README has the full one-time setup walkthrough in the "CI/CD" section.
 
-`scripts/logs.sh [service] [tail]` is the quick remote tail. For rollbacks: `git reset --hard <sha>` on the LXC and `docker compose up -d --build` again — Postgres volume survives container rebuilds, so code-only rollbacks are safe without a restore. Schema rollbacks need a Netcup-backup restore.
+**Local fast path** — `./scripts/deploy.sh`. Pipeline: `cargo test --workspace` (skippable with `--no-test`), `git push`, SSH into the LXC, `git pull --ff-only`, `docker compose up -d --build` (builds locally on the LXC), tails bot logs for 30 s. Use this for tight iteration when CI feels slow. Requires `LXC_HOST` (default `root@10.0.70.240`) and `REPO_PATH` (default `/opt/alert-bot-rs`) exported in the dev shell.
+
+`scripts/logs.sh [service] [tail]` is the quick remote tail. For rollbacks: `git reset --hard <sha>` on the LXC and either `docker compose up -d --build` (local rebuild) or `docker compose pull && up -d` (last image with that sha is still in ghcr.io). Postgres volume survives container rebuilds, so code-only rollbacks are safe; schema rollbacks need a Netcup-backup restore.
 
 ## Conventions worth knowing
 

@@ -66,22 +66,22 @@ needed. Open Telegram, message your bot, send `/start`.
 | `WEBHOOK_URL`        | no       | empty (long-polling) | public HTTPS URL Telegram will POST to                   |
 | `WEBHOOK_LISTEN`     | no       | `0.0.0.0:8080`       | bind address inside the container                        |
 | `WEBHOOK_SECRET`     | no       | empty                | recommended; sent as `X-Telegram-Bot-Api-Secret-Token`   |
-| `CLOUDFLARED_TOKEN`  | no       | empty                | only needed for the `tunnel` profile                     |
 | `RUST_LOG`           | no       | `info,alert_bot=debug` |                                                       |
 
 ## Production deployment (Proxmox LXC + Cloudflare Tunnel)
 
-This is how the live instance runs. Topology:
+This is how the live instance runs. cloudflared lives in its own LXC and
+fronts multiple services on the same Proxmox host; the alert-bot LXC just
+exposes `:8080` on the internal Proxmox bridge so cloudflared can reach it.
 
 ```
-Telegram  ──HTTPS──►  Cloudflare edge  ──tunnel──►  cloudflared (LXC)
-                                                         │
-                                                  http   ▼
-                                                  ┌──────────────┐
-                                                  │ Docker LXC   │
-                                                  │              │
-                                                  │   bot ◄──► postgres
-                                                  └──────────────┘
+Telegram  ──HTTPS──►  Cloudflare edge  ──tunnel──►  cloudflared LXC
+                                                         │ HTTP
+                                                         ▼
+                                                  ┌──────────────────┐
+                                                  │ alert-bot LXC    │
+                                                  │  bot:8080 ◄─► postgres
+                                                  └──────────────────┘
                                                          │
                                                        SFTP nightly
                                                          ▼
@@ -246,6 +246,98 @@ docker compose up -d --build
 The Postgres data isn't touched by container rebuilds (separate volume), so
 this is safe for any code-only rollback. For schema rollbacks you'd restore
 from a `pg_dump` — keep your daily Netcup backups close.
+
+## CI/CD (GitHub Actions + ghcr.io + Cloudflare Access)
+
+Push-and-forget deployment lives in `.github/workflows/deploy.yml`. On every
+push to `main`:
+
+1. **Test** — `cargo test --workspace`
+2. **Build** — Docker image → `ghcr.io/<you>/alert-bot-rs:{latest, sha-XXXXX}`
+3. **Deploy** — SSH into the Futro LXC via Cloudflare Access SSH (no public
+   port on the LXC), `git pull` for compose changes, `docker compose pull`
+   for the new image, `docker compose up -d` to swap
+
+The LXC runs the lightweight prod compose (`docker-compose.yml` + `docker-compose.prod.yml`)
+which **pulls** the image instead of building — no Rust toolchain on the LXC
+needed.
+
+### One-time setup
+
+#### 1. Make the image package public (or set up registry auth on the LXC)
+
+After the first push to ghcr.io, go to GitHub → your profile → Packages →
+the `alert-bot-rs` package → Package settings → Change visibility →
+**Public**. The repo can stay private; only the published image gets pulled.
+
+If you'd rather keep the image private: create a PAT with `read:packages`,
+then on the LXC `echo $PAT | docker login ghcr.io -u <you> --password-stdin`.
+
+#### 2. SSH key for the GitHub Actions runner → LXC
+
+Generate a dedicated key pair (don't reuse your personal one):
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/alertbot-deploy -C "github-actions-deploy"
+# add the public key to the LXC:
+ssh-copy-id -i ~/.ssh/alertbot-deploy.pub root@<lxc-ip>
+# or paste the contents of alertbot-deploy.pub into /root/.ssh/authorized_keys
+```
+
+#### 3. Cloudflare Tunnel: SSH route + Access policy
+
+In the cloudflared LXC's tunnel:
+- Public Hostnames → Add
+- Subdomain: `ssh-alert` (or anything), domain: yours
+- Service: **SSH**, URL: `<bot-lxc-ip>:22`
+
+In Cloudflare Zero Trust → Access → Applications → Add Application:
+- **Self-hosted**, App URL: `ssh-alert.yourdomain.de`
+- Identity providers: **none** required (we authenticate by Service Token)
+- Add a policy: action **Allow**, "Service Auth" rule → "Service Token is …"
+  (create a fresh service token; copy the Client ID and Secret — you only
+  see them once)
+
+#### 4. GitHub repository secrets and variables
+
+Settings → Secrets and variables → Actions:
+
+**Secrets** (encrypted):
+- `LXC_SSH_KEY` — contents of `~/.ssh/alertbot-deploy` (the *private* half)
+- `CF_ACCESS_CLIENT_ID` — from the service token
+- `CF_ACCESS_CLIENT_SECRET` — from the service token
+
+**Variables** (visible in logs):
+- `SSH_HOST` — `ssh-alert.yourdomain.de`
+- `SSH_USER` — `root` (or whatever user you use on the LXC)
+
+#### 5. Switch the LXC to image-based compose
+
+```bash
+# in the LXC, edit /opt/alert-bot-rs/.env:
+COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+```
+
+Then verify the pull works:
+```bash
+docker compose pull bot
+docker compose up -d bot
+```
+
+After the first manual pull succeeds, every subsequent deploy goes through
+the GitHub Actions workflow.
+
+### Manual trigger
+
+The workflow has `workflow_dispatch` so you can re-deploy any commit from
+the Actions tab without pushing — useful for retrying a flaky deploy or
+re-applying after a Cloudflare config change.
+
+### When you don't need CI
+
+For tiny iterative changes you still want fast: `./scripts/deploy.sh`
+remains the local-machine path (push + remote git pull + local build on
+the LXC). Both paths coexist; the LXC accepts either.
 
 ## Architecture
 
