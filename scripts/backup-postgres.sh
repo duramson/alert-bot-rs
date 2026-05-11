@@ -1,39 +1,41 @@
 #!/usr/bin/env bash
 #
-# Daily Postgres backup to a Netcup webhosting SFTP target.
+# Daily Postgres backup → Netcup SFTP. Native (no docker).
 #
-# Streams the Postgres dump → gzip → SFTP upload, no staging file on disk.
-# The dump is `pg_dump --clean --if-exists` so a restore drops + recreates
-# objects, idempotent against an existing schema.
+# Runs as the `postgres` system user via the systemd unit, so peer
+# authentication on the local Unix socket gives us full access to every
+# database without a password in /etc/alertbot-backup.env.
 #
-# Required env (provide via /etc/alertbot-backup.env, see systemd unit):
-#   COMPOSE_DIR           absolute path to the alert-bot-rs checkout
+# pg_dump --clean --if-exists makes restores idempotent: re-running on
+# an existing schema drops and recreates objects.
+#
+# Required env (provide via /etc/alertbot-backup.env):
 #   BACKUP_NETCUP_HOST    e.g. yourhost.netcup.net
 #   BACKUP_NETCUP_USER    SFTP username
 #   BACKUP_NETCUP_PASS    SFTP password
-#   BACKUP_NETCUP_PATH    remote directory (relative to user home), e.g. backups/alertbot
 #
 # Optional env:
-#   RETENTION_DAYS        delete remote dumps older than N days (default 30)
+#   BACKUP_NETCUP_PATH    remote directory (default: backups/alertbot)
+#   DB_NAME               postgres database to dump (default: alertbot)
+#   RETENTION_DAYS        prune remote dumps older than N days (default: 30)
+#
+# Required packages on the host: postgresql-client, curl, sshpass
 
 set -euo pipefail
 
-: "${COMPOSE_DIR:?must be set}"
 : "${BACKUP_NETCUP_HOST:?must be set}"
 : "${BACKUP_NETCUP_USER:?must be set}"
 : "${BACKUP_NETCUP_PASS:?must be set}"
 : "${BACKUP_NETCUP_PATH:=backups/alertbot}"
+: "${DB_NAME:=alertbot}"
 : "${RETENTION_DAYS:=30}"
-
-cd "$COMPOSE_DIR"
 
 DATE=$(date -u +%Y-%m-%dT%H%M%SZ)
 REMOTE_FILE="${BACKUP_NETCUP_PATH}/alertbot-${DATE}.sql.gz"
 
-echo "[backup] dumping to ${REMOTE_FILE}"
+echo "[backup] dumping ${DB_NAME} → ${REMOTE_FILE}"
 
-docker compose exec -T postgres \
-    pg_dump -U "${POSTGRES_USER:-alertbot}" --clean --if-exists "${POSTGRES_DB:-alertbot}" \
+pg_dump --clean --if-exists --no-owner --no-privileges "${DB_NAME}" \
   | gzip -9 \
   | curl --silent --show-error --fail \
          --user "${BACKUP_NETCUP_USER}:${BACKUP_NETCUP_PASS}" \
@@ -43,8 +45,8 @@ docker compose exec -T postgres \
 
 echo "[backup] uploaded"
 
-# Retention: delete remote files older than RETENTION_DAYS.
-# Netcup SFTP supports `rm` over a single sftp batch. We list then filter.
+# Retention: delete remote files older than RETENTION_DAYS. Netcup SFTP
+# accepts a single sftp batch — we list, then issue rm for each match.
 CUTOFF_EPOCH=$(date -u -d "${RETENTION_DAYS} days ago" +%s 2>/dev/null \
               || date -u -v-"${RETENTION_DAYS}d" +%s)
 

@@ -1,10 +1,15 @@
 [Unit]
 Description=alert-bot Postgres backup → Netcup SFTP
-After=docker.service network-online.target
+After=postgresql.service network-online.target
 Wants=network-online.target
+Requires=postgresql.service
 
 [Service]
 Type=oneshot
+# Run as the postgres system user so peer-auth gives us full access to
+# every database via the local Unix socket — no password in the env file.
+User=postgres
+Group=postgres
 EnvironmentFile=/etc/alertbot-backup.env
 ExecStart=/usr/local/bin/alertbot-backup.sh
 StandardOutput=journal
