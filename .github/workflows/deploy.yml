@@ -67,8 +67,11 @@ jobs:
 
       - name: scp binary + install + restart on the LXC
         env:
-          CLOUDFLARE_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CLOUDFLARE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          # cloudflared reads the service token from these two env vars
+          # specifically — the more commonly-named CLOUDFLARE_ACCESS_*
+          # form is for curl, not for `cloudflared access ssh`.
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
         run: |
@@ -94,8 +97,11 @@ jobs:
 
       - name: Tail logs briefly
         env:
-          CLOUDFLARE_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CLOUDFLARE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          # cloudflared reads the service token from these two env vars
+          # specifically — the more commonly-named CLOUDFLARE_ACCESS_*
+          # form is for curl, not for `cloudflared access ssh`.
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
         run: |
