@@ -25,6 +25,11 @@ jobs:
           # Bumped after dropping a chunk of workspace deps — restore-keys
           # was pulling in a stale target/ from the previous tree.
           prefix-key: "v2-native"
+          # Save the cache even when later steps fail, otherwise iterating
+          # on the deploy step (which is failing on Cloudflare Access right
+          # now) keeps blowing the build cache and we rebuild ~250 crates
+          # from scratch on every run.
+          cache-on-failure: true
       - name: cargo test --workspace
         run: cargo test --workspace --quiet
 
