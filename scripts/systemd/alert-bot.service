@@ -1,0 +1,37 @@
+[Unit]
+Description=alert-bot Telegram reminder bot
+Documentation=https://github.com/duramson/alert-bot-rs
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=alertbot
+Group=alertbot
+EnvironmentFile=/etc/alert-bot/config.env
+ExecStart=/usr/local/bin/alert-bot
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening — bot is a network client, doesn't need disk write outside of journald
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+# Resource caps — bot baseline is tiny; raise if you see OOMs
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
