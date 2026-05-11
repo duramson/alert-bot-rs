@@ -20,7 +20,7 @@ Internal crate deps are declared in the workspace `Cargo.toml` so individual cra
 ## Architecture
 
 ### Two long-running tasks
-1. **Telegram dispatcher** (`bot/handlers.rs`) — routes `/alert`, `/galert`, `/list`, `/cancel`, `/tz`, `/lang`, `/start`, `/help`. `dispatch` fetches/upserts the user, then delegates per command. Group-only `/galert` is rejected from DMs. `Alert::can_edit` (in `core`) is the single source of truth for edit/delete permissions.
+1. **Telegram dispatcher** (`bot/handlers.rs`) — routes `/alert`, `/galert`, `/list`, `/cancel`, `/tz`, `/lang`, `/start`, `/help`. A `filter_async` at the dptree entry point calls `try_register_update` first, so any retried webhook with a seen `update_id` is dropped before per-handler code runs (`bot/main.rs`). `dispatch` then fetches/upserts the user and delegates per command. Group-only `/galert` is rejected from DMs. `Alert::can_edit` (in `core`) is the single source of truth for edit/delete permissions.
 2. **Delivery worker** (`bot/worker.rs`) — runs in a `tokio::spawn`d task. Loop:
    - Compute next wake = `MIN(fire_at) WHERE state = 'pending'` via `next_pending_fire_at`.
    - `tokio::select!` between: that timestamp, a Postgres `NOTIFY alerts_changed` (so newly created alerts wake the worker immediately), or shutdown.
@@ -32,7 +32,7 @@ Internal crate deps are declared in the workspace `Cargo.toml` so individual cra
 ### Postgres schema (`migrations/0001_init.sql`)
 - `users` keyed by `telegram_id`. `upsert_user` is intentionally non-clobbering: it only bumps `updated_at`, never overwrites the user-set `timezone`/`language`.
 - `alerts` with state machine `pending → claimed → sent | failed | cancelled`. Two partial indexes: `alerts_due_idx` on `fire_at WHERE state = 'pending'` (worker hot path) and `alerts_chat_idx WHERE state IN ('pending', 'claimed')` (`/list`).
-- `processed_updates` for Telegram update_id idempotency (reaper purges).
+- `processed_updates` records every Telegram `update_id` the dispatcher has seen; the entry-level filter checks this on every update to deduplicate retried webhooks. Reaper purges entries older than 24h.
 - A trigger on `alerts` (INSERT or UPDATE OF `fire_at`, `state`) calls `pg_notify('alerts_changed', '')` to wake the worker without polling.
 
 ### Transport
@@ -44,7 +44,7 @@ Cargo workspace — every command is run from the repo root.
 
 ```bash
 cargo build                            # build all crates
-cargo build --release --bin alert-bot  # binary used in Dockerfile
+cargo build --release --bin alert-bot  # production binary, glibc-dynamic
 cargo test                             # all tests across the workspace
 cargo test -p parser                   # only the parser crate
 cargo test -p parser rel_minutes_short # single test by name
@@ -59,38 +59,39 @@ The parser has the bulk of the unit tests (in `crates/parser/src/lib.rs`), with 
 
 ```bash
 cp .env.example .env                # set BOT_TOKEN, POSTGRES_PASSWORD
-docker compose up -d postgres       # just the DB
-DATABASE_URL=postgres://alertbot:<pw>@localhost:5432/alertbot \
-  BOT_TOKEN=... cargo run -p alert-bot
+docker compose up -d postgres       # local-dev DB, bound to 127.0.0.1:5432
+cargo run -p alert-bot
 ```
 
-Migrations run automatically on startup (`PgStore::migrate` in `main.rs`). With no `WEBHOOK_URL` the bot uses long polling — fine for dev.
-
-### Running in Docker
-
-```bash
-docker compose up -d                              # bot + postgres
-docker compose --profile tunnel up -d             # also start cloudflared
-docker compose logs -f bot
-```
-
-The `cloudflared` service is gated behind the `tunnel` profile and exposes the webhook port via Cloudflare Tunnel; `WEBHOOK_URL` in `.env` must point at the Cloudflare hostname.
+Migrations run automatically on startup (`PgStore::migrate` in `main.rs`). With no `WEBHOOK_URL` the bot uses long polling — fine for dev. Use a separate `@BotFather` dev bot token so it doesn't fight the production webhook target for ownership.
 
 ## Production deployment
 
-The live instance runs on a Proxmox-hosted Debian-12 LXC (created via the community-scripts `docker.sh` helper). `docker compose` brings up the bot + Postgres; the bot publishes `:8080` on the LXC's host network (Postgres stays internal). A separate cloudflared LXC on the same Proxmox host fronts a Cloudflare Tunnel that routes a public hostname to `<bot-lxc-ip>:8080` so Telegram can POST webhooks. The repo lives at `/opt/alert-bot-rs` on the bot LXC.
+The live instance runs on a Proxmox LXC created via the community-scripts `postgresql.sh` helper (Debian 12 + Postgres 16 pre-installed). **No Docker.** Both Postgres and the bot run as native systemd units on the same LXC:
 
-Off-site backups: `scripts/backup-postgres.sh` runs nightly via a systemd timer (`alertbot-backup.timer` → 03:30 UTC), streaming `pg_dump | gzip | SFTP` straight to a Netcup webhosting target. Config in `/etc/alertbot-backup.env` (chmod 600). Retention: 30 days, enforced by the script itself (lists remote files, deletes anything older than `RETENTION_DAYS`).
+- `/usr/local/bin/alert-bot` — the binary, replaced by CI on every deploy
+- `/etc/alert-bot/config.env` — secrets + per-host config, chmod 600
+- `/etc/systemd/system/alert-bot.service` — runs as `User=alertbot` with `ProtectSystem=strict`, `MemoryMax=256M`
+- Postgres connection uses **peer auth via the local Unix socket** — the bot's system user `alertbot` matches the postgres role `alertbot`, so `DATABASE_URL=postgres:///alertbot?host=/var/run/postgresql` has no password baked in
+- The repo isn't checked out on the LXC at all — only the binary, the env file, and the unit files
+
+The same Proxmox host runs a separate cloudflared LXC that fronts both the webhook (HTTPS → `<bot-lxc-ip>:8080`) and SSH (over Cloudflare Access, no public SSH port) onto this bot LXC.
+
+Off-site backups: `scripts/backup-postgres.sh` (deployed to `/usr/local/bin/alertbot-backup.sh`) runs nightly via `alertbot-backup.timer` at 03:30 UTC. The unit runs as `User=postgres` so peer auth gives full DB access without a password in `/etc/alertbot-backup.env`. The script streams `pg_dump | gzip | curl SFTP` to Netcup webhosting and prunes anything older than `RETENTION_DAYS` (default 30) on the remote side.
 
 ## Update workflow
 
-Two coexisting paths:
+Single path: GitHub Actions. `.github/workflows/deploy.yml` on every push to `master`:
 
-**CI/CD (preferred for production)** — `.github/workflows/deploy.yml`. On push to `main`: `cargo test`, build the image with `docker buildx`, push to `ghcr.io/<you>/alert-bot-rs:{latest, sha-XXXXX}`, then SSH into the LXC via Cloudflare Access SSH (no public SSH port) and run `git pull && docker compose pull bot && docker compose up -d`. Required GH secrets: `LXC_SSH_KEY`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`. GH variables: `SSH_HOST`, `SSH_USER`. The LXC must have `COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml` in its `.env` so compose layers the prod override (which swaps the local `build:` for `image: ghcr.io/...`). Compose's auto-loading of `.env` picks this up — no `-f` flags needed. README has the full one-time setup walkthrough in the "CI/CD" section.
+1. `cargo test --workspace`
+2. `cargo build --release --bin alert-bot` on **`ubuntu-22.04`** (pinned — its glibc 2.35 baseline stays compatible with Debian 12's 2.36; `ubuntu-latest` would silently break the deploy)
+3. Strip + sha256 + publish to the rolling `latest` GitHub Release
+4. SSH into the LXC via Cloudflare Access SSH (no public port), `curl` the binary, verify the checksum, `install -m 0755` to `/usr/local/bin/alert-bot`, `systemctl restart alert-bot`
+5. 20 s of `journalctl -u alert-bot -f` so a broken startup surfaces in the workflow
 
-**Local fast path** — `./scripts/deploy.sh`. Pipeline: `cargo test --workspace` (skippable with `--no-test`), `git push`, SSH into the LXC, `git pull --ff-only`, `docker compose up -d --build` (builds locally on the LXC), tails bot logs for 30 s. Use this for tight iteration when CI feels slow. Requires `LXC_HOST` (default `root@10.0.70.240`) and `REPO_PATH` (default `/opt/alert-bot-rs`) exported in the dev shell.
+Required GH secrets: `LXC_SSH_KEY`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`. GH variables: `SSH_HOST`, `SSH_USER`.
 
-`scripts/logs.sh [service] [tail]` is the quick remote tail. For rollbacks: `git reset --hard <sha>` on the LXC and either `docker compose up -d --build` (local rebuild) or `docker compose pull && up -d` (last image with that sha is still in ghcr.io). Postgres volume survives container rebuilds, so code-only rollbacks are safe; schema rollbacks need a Netcup-backup restore.
+`scripts/logs.sh [service] [tail]` is the quick remote tail (`journalctl -u <service> -f` over SSH). Rollback: download an older release asset by hand and replace `/usr/local/bin/alert-bot`. Postgres data survives binary swaps (separate filesystem); schema rollbacks need a Netcup-backup restore.
 
 ## Conventions worth knowing
 
