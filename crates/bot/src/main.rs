@@ -62,6 +62,18 @@ async fn main() -> Result<()> {
     };
 
     let handler = dptree::entry()
+        // Telegram retries webhook deliveries on timeout — drop duplicates by
+        // update_id. Errors are logged and we fall through (better to risk a
+        // duplicate than to silently swallow the update).
+        .filter_async(|update: Update, store: Arc<PgStore>| async move {
+            match store.try_register_update(update.id.0 as i64).await {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    tracing::error!(error = ?e, update_id = update.id.0, "try_register_update failed");
+                    true
+                }
+            }
+        })
         .branch(
             Update::filter_message()
                 .filter_command::<Command>()

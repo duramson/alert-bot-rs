@@ -113,9 +113,11 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         | Err(teloxide::RequestError::Api(ApiError::ChatNotFound))
         | Err(teloxide::RequestError::Api(ApiError::UserDeactivated)) => {
             // Permanent: nobody to deliver to.
-            let msg = format!("permanent: {}", "delivery target unreachable");
             warn!(id = alert.id, "permanent delivery failure");
-            if let Err(e) = store.mark_failed(alert.id, &msg).await {
+            if let Err(e) = store
+                .mark_failed(alert.id, "permanent: delivery target unreachable")
+                .await
+            {
                 error!(id = alert.id, error = ?e, "mark_failed failed");
             }
         }
