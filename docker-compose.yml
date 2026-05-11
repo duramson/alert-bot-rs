@@ -1,9 +1,8 @@
-# The bot exposes :8080 on the host network so an external Cloudflare Tunnel
-# (or any reverse proxy) can reach it. Postgres stays on the internal compose
-# network — never exposed.
+# Local development database only. The bot itself runs natively with
+# `cargo run -p alert-bot`, with DATABASE_URL pointing at this container.
 #
-# For local dev without a public endpoint: leave WEBHOOK_URL empty in `.env`
-# and the bot falls back to long-polling.
+# Production does NOT use this file — the LXC runs both Postgres and
+# the bot as native services. See README.md → "Production deployment".
 services:
   postgres:
     image: postgres:16-alpine
@@ -14,38 +13,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-alertbot}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Bound to localhost so `cargo run` on the dev host can connect.
+      # Not exposed on the LAN.
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 5s
       timeout: 3s
       retries: 10
-    networks: [alertbot]
-
-  bot:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-alertbot}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-alertbot}
-      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN must be set}
-      WEBHOOK_URL: ${WEBHOOK_URL:-}
-      WEBHOOK_LISTEN: 0.0.0.0:8080
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
-      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
-      RUST_LOG: ${RUST_LOG:-info,alert_bot=debug}
-    ports:
-      # Reachable on the LXC's host network for an external cloudflared.
-      # If you run cloudflared in the same compose, drop this and add a
-      # service that talks to bot:8080 over the internal network.
-      - "8080:8080"
-    networks: [alertbot]
 
 volumes:
   postgres_data:
-
-networks:
-  alertbot:
