@@ -151,7 +151,7 @@ impl Match {
             Self::Named { day, time, end_offset } => {
                 let had_time = time.is_some();
                 let t = time.unwrap_or(DEFAULT_TIME);
-                let date = resolve_named_day(day, ctx);
+                let date = resolve_named_day(day, t, ctx);
                 let fire = local_to_utc(date, t, ctx.tz)?;
                 Ok((fire, end_offset, had_time))
             }
@@ -259,24 +259,45 @@ fn try_named_day(tokens: &[Token<'_>]) -> Option<Match> {
     Some(Match::Named { day, time, end_offset })
 }
 
-fn resolve_named_day(day: NamedDay, ctx: &ParseContext) -> NaiveDate {
+fn resolve_named_day(day: NamedDay, time: NaiveTime, ctx: &ParseContext) -> NaiveDate {
     let today = ctx.now_utc.with_timezone(&ctx.tz).date_naive();
     match day {
         NamedDay::Today => today,
         NamedDay::Tomorrow => today + chrono::Duration::days(1),
         NamedDay::DayAfterTomorrow => today + chrono::Duration::days(2),
-        NamedDay::Weekday(target) => next_weekday(today, target),
+        // Pick the first future instance of `target` at `time` — today
+        // qualifies if today's `time` hasn't passed yet, otherwise the next
+        // matching weekday wins. Same simple rule for one-shot weekdays
+        // as Recurrence::next_after uses for recurring ones.
+        NamedDay::Weekday(target) => first_future_weekday(today, target, time, ctx),
     }
 }
 
-fn next_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
-    let from_n = from.weekday().num_days_from_monday() as i64;
-    let target_n = target.num_days_from_monday() as i64;
-    let mut diff = target_n - from_n;
-    if diff <= 0 {
-        diff += 7;
+fn first_future_weekday(
+    today: NaiveDate,
+    target: Weekday,
+    time: NaiveTime,
+    ctx: &ParseContext,
+) -> NaiveDate {
+    use chrono::TimeZone;
+    for offset in 0..=7 {
+        let candidate = today + Duration::days(offset);
+        if candidate.weekday() != target {
+            continue;
+        }
+        let candidate_local = candidate.and_time(time);
+        let candidate_utc = match ctx.tz.from_local_datetime(&candidate_local) {
+            chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
+            chrono::LocalResult::Ambiguous(earlier, _) => earlier.with_timezone(&Utc),
+            chrono::LocalResult::None => continue, // DST gap, try next match
+        };
+        if candidate_utc > ctx.now_utc {
+            return candidate;
+        }
     }
-    from + chrono::Duration::days(diff)
+    // Defensive: within 0..=7 we always hit the target weekday at least
+    // once, so this fallback should be unreachable in practice.
+    today + Duration::days(7)
 }
 
 // ===========================================================================

@@ -285,6 +285,45 @@ mod tests {
         assert_eq!(r.fire_at, expected);
     }
 
+    #[test]
+    fn named_weekday_today_time_still_ahead_picks_today() {
+        // Reference is Friday 2026-05-08 12:00 Berlin; "fr 14:00" is later
+        // today, so it should fire today, not next Friday.
+        let r = p("fr 14:00 workout");
+        assert_eq!(r.text, "workout");
+        let expected = ctx(Language::De)
+            .tz
+            .with_ymd_and_hms(2026, 5, 8, 14, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(r.fire_at, expected);
+    }
+
+    #[test]
+    fn named_weekday_today_time_passed_picks_next_week() {
+        // Same reference, "fr 09:00" — today's 9 a.m. is gone, so next Friday.
+        let r = p("fr 09:00 routine");
+        let expected = ctx(Language::De)
+            .tz
+            .with_ymd_and_hms(2026, 5, 15, 9, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(r.fire_at, expected);
+    }
+
+    #[test]
+    fn named_weekday_today_default_time_passed_picks_next_week() {
+        // No explicit time → default 09:00. Reference is 12:00, so today's
+        // 09:00 has passed → next Friday 09:00.
+        let r = p("fr putzen");
+        let expected = ctx(Language::De)
+            .tz
+            .with_ymd_and_hms(2026, 5, 15, 9, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(r.fire_at, expected);
+    }
+
     // ---- Fuzzy matching ----
 
     #[test]
