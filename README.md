@@ -177,16 +177,22 @@ The bot isn't installed yet — that's step 4.
 
 #### 4. Install the first binary
 
-Until CI is wired up (step 7), grab the latest binary from GitHub
-Releases by hand:
+Until CI is wired up (step 7), build locally on the Mac and scp the
+binary across. Releases on GitHub stay private with the repo, so the
+LXC can't `curl` them without auth — CI gets around this by scp'ing
+from the runner directly (step 7).
+
+```bash
+# on the Mac
+cargo build --release --bin alert-bot
+strip target/release/alert-bot
+scp target/release/alert-bot root@<lxc-ip>:/tmp/alert-bot
+```
 
 ```bash
 # on the LXC
-curl -fsSL https://github.com/<you>/alert-bot-rs/releases/download/latest/alert-bot \
-    -o /usr/local/bin/alert-bot
-curl -fsSL https://github.com/<you>/alert-bot-rs/releases/download/latest/alert-bot.sha256 \
-    | (cd /usr/local/bin && sha256sum -c -)
-chmod +x /usr/local/bin/alert-bot
+install -m 0755 -o root -g root /tmp/alert-bot /usr/local/bin/alert-bot
+rm /tmp/alert-bot
 
 systemctl enable --now alert-bot
 systemctl status alert-bot --no-pager -l
@@ -199,6 +205,13 @@ notification.
 
 Migrations run automatically on every start (`PgStore::migrate`), so the
 schema is materialised on first boot.
+
+> **glibc note.** Building the release locally on macOS produces a
+> Mach-O binary that won't run on Linux. If you're on macOS, either use
+> `cargo zigbuild --target x86_64-unknown-linux-gnu --release` (needs
+> `brew install zig && cargo install cargo-zigbuild`), or just push the
+> commit and let the CI workflow do the build for you — the workflow
+> scp's straight to the LXC after build.
 
 #### 5. Cloudflare Tunnel route → webhook switch
 
@@ -324,22 +337,25 @@ and recreates objects, so running it on a non-empty DB is safe.
 
 ## Update workflow (CI/CD)
 
-Push to `master` → GitHub Actions builds → LXC pulls the new binary and
-restarts. The full pipeline is in
+Push to `master` → GitHub Actions builds → runner scp's straight to the
+LXC and restarts. The full pipeline is in
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
 
 1. **Test** — `cargo test --workspace`
-2. **Build** — `cargo build --release --bin alert-bot` on `ubuntu-22.04`.
-   Pinned so the binary's glibc baseline (2.35) stays compatible with
-   Debian 12 (2.36); `ubuntu-latest` would silently break the deploy as
-   soon as GitHub bumps it.
-3. **Publish** — upload `alert-bot` + `alert-bot.sha256` to the rolling
-   `latest` GitHub Release.
-4. **Deploy** — SSH into the LXC over Cloudflare Access SSH:
-   `curl` the binary, verify `sha256sum`, `install -m 0755` to
-   `/usr/local/bin/alert-bot`, `systemctl restart alert-bot`.
-5. **Tail** — 20s of `journalctl -u alert-bot -f` so a broken startup
+2. **Build & deploy** (one job, so the runner can scp the binary it just
+   built):
+   1. `cargo build --release --bin alert-bot` on `ubuntu-22.04`.
+      Pinned so the binary's glibc baseline (2.35) stays compatible
+      with Debian 13 (2.41 — backward-compatible). If we let
+      `ubuntu-latest` drift past Debian, deploy silently breaks.
+   2. `strip target/release/alert-bot`
+   3. `scp` the binary to the LXC over Cloudflare Access SSH.
+   4. On the LXC: `install -m 0755` to `/usr/local/bin/alert-bot`,
+      then `systemctl restart alert-bot`.
+3. **Tail** — 20s of `journalctl -u alert-bot -f` so a broken startup
    surfaces in the workflow output.
+
+No GitHub Release roundtrip — keeps the repo free to stay private.
 
 ### Manual trigger
 
@@ -359,19 +375,13 @@ Requires `LXC_HOST` (default `root@10.0.70.240`) exported in your shell.
 
 ### Rollback
 
-Every release replaces the binary at the `latest` tag. To go back, grab
-an older asset and replace the binary by hand:
+Trigger the workflow on an older commit:
 
-```bash
-ssh root@<lxc-ip>
-# pick a sha-tagged release from the Actions history or just rerun the
-# workflow on an older commit via workflow_dispatch.
-curl -fsSL https://github.com/<you>/alert-bot-rs/releases/download/<old-tag>/alert-bot \
-    -o /usr/local/bin/alert-bot.new
-chmod +x /usr/local/bin/alert-bot.new
-mv /usr/local/bin/alert-bot.new /usr/local/bin/alert-bot
-systemctl restart alert-bot
-```
+- GitHub → Actions → "Build and deploy to production" → **Run
+  workflow** → pick a branch or tag → run.
+
+That rebuilds + scp's the older commit's binary. Or build locally and
+scp manually (same one-liner as step 4 in the production setup above).
 
 Postgres data isn't touched by binary swaps, so code-only rollbacks are
 safe. Schema rollbacks need a `pg_dump` restore — keep your daily Netcup

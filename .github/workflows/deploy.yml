@@ -13,9 +13,6 @@ concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false   # don't kill mid-deploy if a second push comes in
 
-permissions:
-  contents: write   # create/update GitHub Releases
-
 jobs:
   test:
     name: Test
@@ -31,51 +28,26 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --quiet
 
-  build:
-    name: Build & publish binary
+  deploy:
+    name: Build & deploy to LXC
     needs: test
     # Pin to ubuntu-22.04 so the binary's glibc baseline (2.35) stays
-    # compatible with Debian 12 (glibc 2.36). If we let GitHub bump
-    # `ubuntu-latest` past Debian 12, deploy silently breaks.
+    # compatible with Debian 13 (glibc 2.41 — backward-compatible). If we
+    # let GitHub bump `ubuntu-latest` past Debian, deploy silently breaks.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # Bumped after dropping a chunk of workspace deps — restore-keys
-          # was pulling in a stale target/ from the previous tree.
           prefix-key: "v2-native"
 
       - name: Build release binary
-        run: cargo build --release --bin alert-bot
-
-      - name: Strip + checksum
         run: |
+          cargo build --release --bin alert-bot
           strip target/release/alert-bot
-          sha256sum target/release/alert-bot > target/release/alert-bot.sha256
-          ls -lh target/release/alert-bot target/release/alert-bot.sha256
+          ls -lh target/release/alert-bot
 
-      - name: Publish rolling "latest" release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: Rolling build (master)
-          body: |
-            Auto-built from master @ ${{ github.sha }}.
-
-            Linux x86_64 dynamic binary, glibc ≥ 2.35.
-            Verify with the sidecar `alert-bot.sha256`.
-          files: |
-            target/release/alert-bot
-            target/release/alert-bot.sha256
-          make_latest: 'true'
-
-  deploy:
-    name: Deploy to LXC
-    needs: build
-    runs-on: ubuntu-22.04
-    steps:
       - name: Install cloudflared
         run: |
           curl -fsSL \
@@ -93,35 +65,29 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      - name: Pull binary + restart on the LXC
+      - name: scp binary + install + restart on the LXC
         env:
           CLOUDFLARE_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CLOUDFLARE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
-          REPO: ${{ github.repository }}
         run: |
+          # Push straight from the runner to the LXC over the same
+          # Cloudflare Access SSH proxy. No GitHub Release roundtrip — keeps
+          # the repo free to stay private.
+          scp -o "ProxyCommand=cloudflared access ssh --hostname $SSH_HOST" \
+              -o "StrictHostKeyChecking=accept-new" \
+              -o "UserKnownHostsFile=/dev/null" \
+              target/release/alert-bot \
+              "$SSH_USER@$SSH_HOST:/tmp/alert-bot.new"
+
           ssh -o "ProxyCommand=cloudflared access ssh --hostname $SSH_HOST" \
               -o "StrictHostKeyChecking=accept-new" \
               -o "UserKnownHostsFile=/dev/null" \
-              "$SSH_USER@$SSH_HOST" REPO="$REPO" bash <<'REMOTE'
+              "$SSH_USER@$SSH_HOST" bash <<'REMOTE'
           set -euo pipefail
-
-          tmp=$(mktemp)
-          trap 'rm -f "$tmp" "$tmp.sha256"' EXIT
-
-          curl -fsSL "https://github.com/${REPO}/releases/download/latest/alert-bot"        -o "$tmp"
-          curl -fsSL "https://github.com/${REPO}/releases/download/latest/alert-bot.sha256" -o "$tmp.sha256"
-
-          expected=$(awk '{print $1}' "$tmp.sha256")
-          actual=$(sha256sum "$tmp" | awk '{print $1}')
-          if [ "$expected" != "$actual" ]; then
-              echo "checksum mismatch (expected $expected, got $actual)" >&2
-              exit 1
-          fi
-
-          chmod +x "$tmp"
-          install -m 0755 -o root -g root "$tmp" /usr/local/bin/alert-bot
+          install -m 0755 -o root -g root /tmp/alert-bot.new /usr/local/bin/alert-bot
+          rm -f /tmp/alert-bot.new
           systemctl restart alert-bot
           systemctl is-active alert-bot
           REMOTE
