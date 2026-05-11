@@ -4,25 +4,22 @@ on:
   push:
     branches: [main, master]
     paths-ignore:
-      - 'README.md'
-      - 'CLAUDE.md'
-      - '.gitignore'
+      - '**/*.md'
       - 'docs/**'
-      - '.github/**'
+      - '.gitignore'
   workflow_dispatch:    # manual trigger from the Actions tab
 
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false   # don't kill mid-deploy if a second push comes in
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+permissions:
+  contents: write   # create/update GitHub Releases
 
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,53 +28,45 @@ jobs:
         run: cargo test --workspace --quiet
 
   build:
-    name: Build & push image
+    name: Build & publish binary
     needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.meta.outputs.tags }}
-      sha_tag: ${{ steps.sha.outputs.tag }}
+    # Pin to ubuntu-22.04 so the binary's glibc baseline (2.35) stays
+    # compatible with Debian 12 (glibc 2.36). If we let GitHub bump
+    # `ubuntu-latest` past Debian 12, deploy silently breaks.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Build release binary
+        run: cargo build --release --bin alert-bot
 
-      - uses: docker/login-action@v3
+      - name: Strip + checksum
+        run: |
+          strip target/release/alert-bot
+          sha256sum target/release/alert-bot > target/release/alert-bot.sha256
+          ls -lh target/release/alert-bot target/release/alert-bot.sha256
+
+      - name: Publish rolling "latest" release
+        uses: softprops/action-gh-release@v2
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: latest
+          name: Rolling build (master)
+          body: |
+            Auto-built from master @ ${{ github.sha }}.
 
-      - name: Compute short SHA
-        id: sha
-        run: echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
-
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=short
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            Linux x86_64 dynamic binary, glibc ≥ 2.35.
+            Verify with the sidecar `alert-bot.sha256`.
+          files: |
+            target/release/alert-bot
+            target/release/alert-bot.sha256
+          make_latest: 'true'
 
   deploy:
-    name: Deploy to Futro LXC
+    name: Deploy to LXC
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Install cloudflared
         run: |
@@ -96,25 +85,38 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      - name: Deploy via Cloudflare Access SSH
+      - name: Pull binary + restart on the LXC
         env:
           CLOUDFLARE_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CLOUDFLARE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
-          IMAGE_TAG: ${{ needs.build.outputs.sha_tag }}
+          REPO: ${{ github.repository }}
         run: |
           ssh -o "ProxyCommand=cloudflared access ssh --hostname $SSH_HOST" \
               -o "StrictHostKeyChecking=accept-new" \
               -o "UserKnownHostsFile=/dev/null" \
-              "$SSH_USER@$SSH_HOST" <<EOF
-          set -e
-          cd /opt/alert-bot-rs
-          git pull --ff-only
-          docker compose pull bot
-          docker compose up -d bot
-          docker compose ps
-          EOF
+              "$SSH_USER@$SSH_HOST" REPO="$REPO" bash <<'REMOTE'
+          set -euo pipefail
+
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp" "$tmp.sha256"' EXIT
+
+          curl -fsSL "https://github.com/${REPO}/releases/download/latest/alert-bot"        -o "$tmp"
+          curl -fsSL "https://github.com/${REPO}/releases/download/latest/alert-bot.sha256" -o "$tmp.sha256"
+
+          expected=$(awk '{print $1}' "$tmp.sha256")
+          actual=$(sha256sum "$tmp" | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+              echo "checksum mismatch (expected $expected, got $actual)" >&2
+              exit 1
+          fi
+
+          chmod +x "$tmp"
+          install -m 0755 -o root -g root "$tmp" /usr/local/bin/alert-bot
+          systemctl restart alert-bot
+          systemctl is-active alert-bot
+          REMOTE
 
       - name: Tail logs briefly
         env:
@@ -127,4 +129,4 @@ jobs:
               -o "StrictHostKeyChecking=accept-new" \
               -o "UserKnownHostsFile=/dev/null" \
               "$SSH_USER@$SSH_HOST" \
-              "cd /opt/alert-bot-rs && timeout 20 docker compose logs --tail=30 -f bot || true"
+              "timeout 20 journalctl -u alert-bot -n 30 -f || true"
