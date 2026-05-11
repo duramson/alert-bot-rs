@@ -65,26 +65,50 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
+      - name: Sanity-check Cloudflare Access creds
+        env:
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+        run: |
+          echo "Hostname: $SSH_HOST"
+          echo "CF_ID length: ${#CF_ID}    (looks like X.access if ends with '.access')"
+          echo "CF_ID ends with: ...${CF_ID: -8}"
+          echo "CF_SECRET length: ${#CF_SECRET}"
+          # Hit the protected hostname with the service token via curl.
+          # 200 = creds + policy good. 403 = creds wrong or policy denies.
+          # Anything else = routing/tunnel problem.
+          code=$(curl -s -o /tmp/cf_body -w "%{http_code}" \
+               -H "CF-Access-Client-Id: $CF_ID" \
+               -H "CF-Access-Client-Secret: $CF_SECRET" \
+               "https://$SSH_HOST/" || true)
+          echo "HTTP status: $code"
+          head -c 500 /tmp/cf_body || true
+          echo
+          if [ "$code" != "200" ] && [ "$code" != "404" ] && [ "$code" != "426" ]; then
+            echo "::error::Cloudflare Access rejected the service token (status $code)"
+            exit 1
+          fi
+
       - name: scp binary + install + restart on the LXC
         env:
-          # cloudflared reads the service token from these two env vars
-          # specifically — the more commonly-named CLOUDFLARE_ACCESS_*
-          # form is for curl, not for `cloudflared access ssh`.
-          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
         run: |
-          # Push straight from the runner to the LXC over the same
-          # Cloudflare Access SSH proxy. No GitHub Release roundtrip — keeps
-          # the repo free to stay private.
-          scp -o "ProxyCommand=cloudflared access ssh --hostname $SSH_HOST" \
+          # Pass service token as CLI flags rather than env vars — env var
+          # names have shifted across cloudflared releases (TUNNEL_*,
+          # CLOUDFLARED_*, CLOUDFLARE_*) and the flag form is stable.
+          PROXY="cloudflared access ssh --hostname $SSH_HOST --service-token-id $CF_ID --service-token-secret $CF_SECRET"
+
+          scp -o "ProxyCommand=$PROXY" \
               -o "StrictHostKeyChecking=accept-new" \
               -o "UserKnownHostsFile=/dev/null" \
               target/release/alert-bot \
               "$SSH_USER@$SSH_HOST:/tmp/alert-bot.new"
 
-          ssh -o "ProxyCommand=cloudflared access ssh --hostname $SSH_HOST" \
+          ssh -o "ProxyCommand=$PROXY" \
               -o "StrictHostKeyChecking=accept-new" \
               -o "UserKnownHostsFile=/dev/null" \
               "$SSH_USER@$SSH_HOST" bash <<'REMOTE'
@@ -97,15 +121,13 @@ jobs:
 
       - name: Tail logs briefly
         env:
-          # cloudflared reads the service token from these two env vars
-          # specifically — the more commonly-named CLOUDFLARE_ACCESS_*
-          # form is for curl, not for `cloudflared access ssh`.
-          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
         run: |
-          ssh -o "ProxyCommand=cloudflared access ssh --hostname $SSH_HOST" \
+          PROXY="cloudflared access ssh --hostname $SSH_HOST --service-token-id $CF_ID --service-token-secret $CF_SECRET"
+          ssh -o "ProxyCommand=$PROXY" \
               -o "StrictHostKeyChecking=accept-new" \
               -o "UserKnownHostsFile=/dev/null" \
               "$SSH_USER@$SSH_HOST" \
