@@ -24,6 +24,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Bumped after dropping a chunk of workspace deps — restore-keys
+          # was pulling in a stale target/ from the previous tree.
+          prefix-key: "v2-native"
       - name: cargo test --workspace
         run: cargo test --workspace --quiet
 
@@ -38,6 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Bumped after dropping a chunk of workspace deps — restore-keys
+          # was pulling in a stale target/ from the previous tree.
+          prefix-key: "v2-native"
 
       - name: Build release binary
         run: cargo build --release --bin alert-bot
