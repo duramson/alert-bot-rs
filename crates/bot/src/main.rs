@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use teloxide::dispatching::ShutdownToken;
 use teloxide::update_listeners::webhooks;
 use teloxide::prelude::*;
 use teloxide::types::BotCommand;
@@ -52,7 +53,6 @@ async fn main() -> Result<()> {
         .await;
 
     let shutdown = Arc::new(Notify::new());
-    spawn_signal_handler(shutdown.clone(), notifier.clone());
 
     let worker_handle = {
         let bot = bot.clone();
@@ -82,10 +82,18 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(handlers::callback_dispatch))
         .branch(Update::filter_message().endpoint(handlers::handle_unhandled));
 
+    // No `.enable_ctrlc_handler()` — that one only listens for SIGINT.
+    // We install our own handler below that covers both SIGTERM and SIGINT
+    // and feeds the dispatcher's ShutdownToken on either.
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![store.clone()])
-        .enable_ctrlc_handler()
         .build();
+
+    spawn_signal_handler(
+        shutdown.clone(),
+        dispatcher.shutdown_token(),
+        notifier.clone(),
+    );
 
     match config.transport {
         Transport::Webhook {
@@ -226,7 +234,11 @@ async fn register_command_menus(bot: &Bot) {
     }
 }
 
-fn spawn_signal_handler(shutdown: Arc<Notify>, notifier: AdminNotifier) {
+fn spawn_signal_handler(
+    shutdown: Arc<Notify>,
+    dispatcher_token: ShutdownToken,
+    notifier: AdminNotifier,
+) {
     tokio::spawn(async move {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
@@ -250,6 +262,18 @@ fn spawn_signal_handler(shutdown: Arc<Notify>, notifier: AdminNotifier) {
         notifier
             .notify(&format!("🛑 {signal_name} received, shutting down"))
             .await;
+
+        // Tell the teloxide dispatcher to stop accepting updates. Without
+        // this, `Dispatcher::dispatch{,_with_listener}` ignores SIGTERM
+        // (teloxide's built-in ctrlc handler only catches SIGINT), so
+        // systemd has to SIGKILL us after TimeoutStopSec — see the May 11
+        // production log where a `systemctl restart` hung for 90s before
+        // SIGKILL fired and the new process came up.
+        if let Err(e) = dispatcher_token.shutdown() {
+            tracing::warn!(error = ?e, "dispatcher shutdown failed (already idle?)");
+        }
+        // Wake the worker too. The dispatcher's awaiter in main() will
+        // resolve on its own once `shutdown()` above propagates.
         shutdown.notify_waiters();
     });
 }
