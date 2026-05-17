@@ -56,37 +56,118 @@ pub fn welcome(lang: Language) -> &'static str {
 pub fn help(lang: Language) -> &'static str {
     match lang {
         Language::De => "<b>Befehle</b>\n\
-            /alert &lt;zeit&gt; &lt;text&gt; — Reminder. Nur du kannst ihn löschen. Funktioniert im Privatchat und in Gruppen.\n\
-            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder, jeder im Chat kann ihn löschen. Nur in Gruppen.\n\
+            /alert &lt;zeit&gt; &lt;text&gt; — Reminder. Nur du kannst ihn löschen.\n\
+            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder. Jeder im Chat kann löschen.\n\
             /list — aktive Reminder anzeigen\n\
             /cancel &lt;id&gt; — Reminder löschen\n\
-            /tz &lt;zone&gt; — Zeitzone setzen (z.B. Europe/Berlin)\n\
+            /tz &lt;zone&gt; — Zeitzone (z.B. Europe/Berlin)\n\
             /lang &lt;de oder en&gt; — Sprache umschalten\n\n\
-            <b>Einmalig</b>\n\
-            • 5m, 2h, 30d, 1w\n\
-            • 30.4.26 oder 30.04.2026 14:30\n\
-            • morgen 9 Uhr, do 14:00, übermorgen\n\n\
-            <b>Wiederkehrend</b> (Prefix * oder jeden/alle)\n\
-            • *30m wasser, alle 2h pause\n\
-            • *1d vitamin, jeden tag 7 Uhr aufstehen\n\
-            • *do 14:00 standup, jeden mo,mi,fr 9 yoga\n\
-            • *1. miete, *24.12 heiligabend",
+            <b>Einmalig</b>  <i>(antippen zum Ausklappen)</i>\n\
+            <blockquote expandable><i>Relativ ab jetzt</i>\n\
+            5m Kaffee — in 5 Minuten\n\
+            2h Pause — in 2 Stunden\n\
+            30d Abo kündigen — in 30 Tagen\n\
+            1w Miete — in 1 Woche\n\
+            2M Versicherung — in 2 Monaten (selber Monatstag)\n\
+            1Y Geburtstag — in 1 Jahr (selbes Datum)\n\
+            7h30m Pause — Stunden + Minuten kombiniert\n\
+            1Y2M15d Test — Reihenfolge Y &gt; M &gt; w &gt; d &gt; h &gt; m &gt; s\n\n\
+            <i>Datum</i>\n\
+            30.4.26 Termin — am 30.04.2026 um 09:00\n\
+            30.04.2026 14:30 Arzt — Datum + Uhrzeit\n\
+            30.4 Geburtstag — nächstes Auftreten\n\
+            2026-12-31 Sylvester — ISO-Form\n\n\
+            <i>Uhrzeit (nächstes Auftreten)</i>\n\
+            22:00 Bier — heute 22:00, sonst morgen\n\
+            14 Uhr Treffen — kurz für 14:00\n\
+            2pm Meeting — am/pm geht auch\n\n\
+            <i>Benannte Tage</i>\n\
+            morgen 9 Uhr Arzt\n\
+            übermorgen Treffen\n\
+            do 14:00 Standup — nächster Donnerstag\n\
+            fr Putzen — nächster Freitag (09:00 Default)\n\n\
+            <i>Mit Override-Uhrzeit (nur ohne Stunden/Min/Sek)</i>\n\
+            2d 11:00 Vitamin — übermorgen 11:00\n\
+            1w 18:00 Zahlen — in 1 Woche 18:00\n\
+            1Y 9:00 Jubiläum — nächstes Jahr 09:00</blockquote>\n\n\
+            <b>Wiederkehrend</b>  <i>(Prefix * oder jeden/alle)</i>\n\
+            <blockquote expandable><i>Intervall</i>\n\
+            *30m Wasser — alle 30 Minuten\n\
+            alle 2h Pause — synonym zu *2h\n\
+            *1d Vitamin — täglich um 09:00\n\
+            *2d 11:00 Tabletten — alle 2 Tage 11:00\n\n\
+            <i>Wochentage</i>\n\
+            *do 14:00 Standup — jeden Donnerstag\n\
+            *mo,mi,fr 9 Yoga — Mo/Mi/Fr um 09:00\n\
+            jeden montag yoga — Langform\n\n\
+            <i>Monatlich</i>\n\
+            *1. Miete — jeden 1. um 09:00\n\
+            *15. 18:00 Abrechnung — jeden 15. um 18:00\n\
+            *31. Bilanz — letzter Tag des Monats (Hinweis bei Erstellung)\n\n\
+            <i>Jährlich</i>\n\
+            *24.12 Heiligabend — jedes Jahr\n\
+            *29.2 Schaltjahr — Feb 28/29 (Hinweis bei Erstellung)</blockquote>\n\n\
+            <b>Gut zu wissen</b>\n\
+            • <b>m</b> = Minuten, <b>M</b> = Monate (Groß/klein zählt!)\n\
+            • Tippfehler werden korrigiert: donnerstah → Donnerstag\n\
+            • Mindestintervall 30 Min, Max einmalig 50 Jahre\n\
+            • <i>heute</i>/<i>today</i> ist absichtlich raus — nimm direkt die Uhrzeit",
         Language::En => "<b>Commands</b>\n\
-            /alert &lt;time&gt; &lt;text&gt; — reminder. Only you can cancel it. Works in DMs and groups.\n\
-            /galert &lt;time&gt; &lt;text&gt; — group reminder, anyone in the chat can cancel it. Groups only.\n\
+            /alert &lt;time&gt; &lt;text&gt; — reminder. Only you can cancel it.\n\
+            /galert &lt;time&gt; &lt;text&gt; — group reminder. Anyone in the chat can cancel.\n\
             /list — show active reminders\n\
             /cancel &lt;id&gt; — delete a reminder\n\
             /tz &lt;zone&gt; — set timezone (e.g. Europe/Berlin)\n\
             /lang &lt;de or en&gt; — switch language\n\n\
-            <b>One-shot</b>\n\
-            • 5m, 2h, 30d, 1w\n\
-            • 30.4.26 or 30.04.2026 14:30\n\
-            • tomorrow 9, thu 14:00\n\n\
-            <b>Recurring</b> (prefix * or every)\n\
-            • *30m water, every 2h break\n\
-            • *1d vitamin, every day 7am wake\n\
-            • *thu 14:00 standup, every mon,wed,fri 9 yoga\n\
-            • *1. rent, *24.12 christmas",
+            <b>One-shot</b>  <i>(tap to expand)</i>\n\
+            <blockquote expandable><i>Relative to now</i>\n\
+            5m coffee — in 5 minutes\n\
+            2h break — in 2 hours\n\
+            30d cancel sub — in 30 days\n\
+            1w rent — in 1 week\n\
+            2M insurance — in 2 months (same day-of-month)\n\
+            1Y birthday — in 1 year (same date)\n\
+            7h30m break — hours + minutes combined\n\
+            1Y2M15d test — order Y &gt; M &gt; w &gt; d &gt; h &gt; m &gt; s\n\n\
+            <i>Date</i>\n\
+            30.4.26 appointment — on 30 Apr 2026 at 09:00\n\
+            30.04.2026 14:30 doctor — date + time\n\
+            30.4 birthday — next occurrence\n\
+            2026-12-31 new year — ISO form\n\n\
+            <i>Clock-time (next occurrence)</i>\n\
+            22:00 beer — today 22:00, else tomorrow\n\
+            14 Uhr meeting — short for 14:00\n\
+            2pm meeting — am/pm works too\n\n\
+            <i>Named day</i>\n\
+            tomorrow 9 doctor\n\
+            thu 14:00 standup — next Thursday\n\
+            fri cleanup — next Friday (09:00 default)\n\n\
+            <i>With override clock (only without hours/min/sec)</i>\n\
+            2d 11:00 vitamin — day after tomorrow 11:00\n\
+            1w 18:00 pay — in 1 week 18:00\n\
+            1Y 9:00 anniversary — in 1 year 09:00</blockquote>\n\n\
+            <b>Recurring</b>  <i>(prefix * or every)</i>\n\
+            <blockquote expandable><i>Interval</i>\n\
+            *30m water — every 30 minutes\n\
+            every 2h break — synonym for *2h\n\
+            *1d vitamin — daily at 09:00\n\
+            *2d 11:00 pills — every 2 days at 11:00\n\n\
+            <i>Weekdays</i>\n\
+            *thu 14:00 standup — every Thursday\n\
+            *mon,wed,fri 9 yoga — Mon/Wed/Fri at 09:00\n\
+            every monday yoga — long form\n\n\
+            <i>Monthly</i>\n\
+            *1. rent — every 1st at 09:00\n\
+            *15. 18:00 billing — every 15th at 18:00\n\
+            *31. balance — last day of month (one-time hint at creation)\n\n\
+            <i>Yearly</i>\n\
+            *24.12 christmas — every year\n\
+            *29.2 leap day — Feb 28/29 (one-time hint at creation)</blockquote>\n\n\
+            <b>Good to know</b>\n\
+            • <b>m</b> = minutes, <b>M</b> = months (case matters!)\n\
+            • Typos are auto-corrected: thurzday → Thursday\n\
+            • Minimum interval 30 min, max one-shot offset 50 years\n\
+            • <i>today</i>/<i>heute</i> is deliberately rejected — use the clock time directly",
     }
 }
 
@@ -306,5 +387,24 @@ pub fn lang_invalid(lang: Language) -> &'static str {
     match lang {
         Language::De => "Verfügbare Sprachen: de, en",
         Language::En => "Available languages: de, en",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Telegram's `sendMessage` rejects payloads longer than 4096 chars.
+    /// `/help` is the longest static string we send, so guard it directly.
+    #[test]
+    fn help_fits_telegram_limit() {
+        const TELEGRAM_LIMIT: usize = 4096;
+        for lang in [Language::De, Language::En] {
+            let len = help(lang).chars().count();
+            assert!(
+                len < TELEGRAM_LIMIT,
+                "help({lang:?}) is {len} chars, Telegram limit is {TELEGRAM_LIMIT}"
+            );
+        }
     }
 }
