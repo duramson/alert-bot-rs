@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     store.migrate().await?;
     info!("migrations applied");
 
-    let bot = Bot::new(&config.bot_token);
+    let bot = Bot::with_client(&config.bot_token, build_http_client()?);
     register_command_menus(&bot).await;
 
     let notifier = AdminNotifier::new(bot.clone(), config.admin_chat_id);
@@ -203,6 +203,24 @@ fn init_tracing() {
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
+}
+
+/// Reqwest client tuned for long-lived HTTPS connections to api.telegram.org.
+/// Adds TCP keepalive (so dead conns are detected proactively instead of on
+/// the next request) and an aggressive idle timeout (so the pool recycles
+/// before NAT timeouts kick in). Defaults inherited from
+/// `teloxide::net::default_reqwest_settings` for the connect/request timeouts.
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    use std::time::Duration;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(17))
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .build()
+        .context("building reqwest client for teloxide")?;
+    Ok(client)
 }
 
 /// Register one command list per supported language plus an English default

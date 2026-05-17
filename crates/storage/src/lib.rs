@@ -42,6 +42,13 @@ impl PgStore {
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            // Ping every connection before handing it out. Cheap (single
+            // round-trip), avoids the "first request after idle silently
+            // fails because Postgres / NAT killed the conn" class of bugs.
+            .test_before_acquire(true)
+            // Recycle idle connections after 10 min so they don't outlive
+            // postgres's own idle-in-transaction or NAT keepalive limits.
+            .idle_timeout(std::time::Duration::from_secs(600))
             .connect(url)
             .await?;
         Ok(Self { pool })

@@ -20,6 +20,12 @@ tokio = { version = "1.41", features = ["full"] }
 # Telegram (pulls axum transitively via the `webhooks-axum` feature)
 teloxide = { version = "0.13", features = ["macros", "webhooks-axum"] }
 
+# HTTP client we hand to teloxide explicitly so we can set tcp_keepalive and
+# tighter pool_idle_timeout — defaults let pooled HTTPS conns to api.telegram.org
+# go silently dead behind NAT, then the first SendMessage after idle hangs in
+# Connect-TimedOut and the user has to retry.
+reqwest = { version = "0.11", default-features = false, features = ["default-tls"] }
+
 # Database
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
