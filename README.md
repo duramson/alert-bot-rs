@@ -20,14 +20,21 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
 
 ## Features
 
-- **Compact slash syntax** — `/alert 5m text`, `/alert 30d text`,
-  `/alert 30.4.26 text`, `/alert morgen 9 Uhr text`, `/alert do 14:00 text`.
+- **Compact slash syntax** — `/alert 5m text`, `/alert 7h30m text`,
+  `/alert 1Y2M15d text`, `/alert 22:00 text` (next 22:00),
+  `/alert 30.4.26 text`, `/alert 2026-04-30 text`, `/alert 2pm text`,
+  `/alert morgen 9 Uhr text`, `/alert do 14:00 text`. Case-sensitive `M`/`Y`
+  for months / years (lowercase `m` = minute). Full input contract in
+  `RULES.md`.
 - **Recurring** — `*` prefix or `every`/`alle`/`jeden`. `*30m water`,
   `*1d vitamin`, `*do 14:00 standup`, `*mo,mi,fr 9 yoga`, `*1. rent`,
-  `*24.12 christmas`. Minimum interval 30 minutes.
-- **DE + EN parser** — keywords (`heute`/`today`, `morgen`/`tomorrow`, weekdays,
-  `Uhr`, time units) accept both languages and tolerate typos via Levenshtein
-  distance with adaptive thresholds.
+  `*24.12 christmas`. `*31.` and `*29.2` fall back to the last day of the
+  month / Feb 28 in non-leap years and announce that once at creation.
+  Minimum interval 30 minutes.
+- **DE + EN parser** — keywords (`morgen`/`tomorrow`, weekdays, `Uhr`, time
+  units) accept both languages and tolerate typos via Levenshtein distance
+  with adaptive thresholds. `heute`/`today` is intentionally rejected with
+  a hint to use bare clock-time instead.
 - **Group reminders with two scopes**
   - `/alert` in a group fires in the group, but only the creator can cancel it.
   - `/galert` is a shared group reminder; anyone in the chat can cancel.

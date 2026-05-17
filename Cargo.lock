@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alert-bot"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alert-bot-core",
  "alert-bot-storage",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "alert-bot-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "alert-bot-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alert-bot-core",
  "chrono",
@@ -1448,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "parser"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alert-bot-core",
  "chrono",
