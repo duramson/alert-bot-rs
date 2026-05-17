@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod recurrence;
 
-pub use recurrence::{Recurrence, RecurrencePattern};
+pub use recurrence::{schedule_from_legacy, Schedule, ScheduleError};
 
 /// Telegram chat type as reported by the Bot API. We persist the raw string
 /// so that future Telegram additions don't require a migration.
@@ -146,6 +146,10 @@ impl Language {
 }
 
 /// Persisted alert.
+///
+/// `fire_at` is the *next* fire time, mutated after each delivery for
+/// recurring alerts. `schedule` carries the immutable anchor + RRULE that
+/// the worker uses to compute subsequent fires.
 #[derive(Debug, Clone)]
 pub struct Alert {
     pub id: i64,
@@ -155,7 +159,7 @@ pub struct Alert {
     pub scope: AlertScope,
     pub text: String,
     pub fire_at: DateTime<Utc>,
-    pub recurrence: Option<RecurrencePattern>,
+    pub schedule: Schedule,
     pub state: AlertState,
     pub attempts: i16,
     pub last_error: Option<String>,
@@ -180,7 +184,8 @@ impl Alert {
     }
 }
 
-/// New-alert payload as constructed from a parsed command.
+/// New-alert payload as constructed from a parsed command. For new alerts,
+/// `schedule.dtstart == fire_at` (they're set to the same value at creation).
 #[derive(Debug, Clone)]
 pub struct NewAlert {
     pub user_id: i64,
@@ -189,5 +194,5 @@ pub struct NewAlert {
     pub scope: AlertScope,
     pub text: String,
     pub fire_at: DateTime<Utc>,
-    pub recurrence: Option<RecurrencePattern>,
+    pub schedule: Schedule,
 }

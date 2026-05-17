@@ -2,8 +2,9 @@
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Tz;
+use rrule::{Frequency, NWeekday, RRule, Unvalidated};
 
-use botcore::{Language, RecurrencePattern};
+use botcore::{Language, Schedule};
 
 /// Compact form for `/list` rows.
 pub fn format_local_compact(dt: DateTime<Utc>, tz: Tz, _lang: Language) -> String {
@@ -62,53 +63,86 @@ fn weekday_short(d: chrono::Weekday, lang: Language) -> &'static str {
     }
 }
 
-/// Compact, human-readable description of a recurrence pattern, e.g.
-/// `alle 30min`, `täglich 09:00`, `Mo,Mi,Fr 09:00`, `jeden 1. 09:00`.
-pub fn format_recurrence_short(pattern: &RecurrencePattern, lang: Language) -> String {
-    match pattern {
-        RecurrencePattern::Interval { seconds } => {
-            let dur = format_duration_human(*seconds);
+/// Compact, human-readable description of a Schedule's recurrence pattern,
+/// e.g. `alle 30min`, `täglich 09:00`, `Mo,Mi,Fr 09:00`, `jeden 1. 09:00`.
+/// Returns `None` for one-shot schedules.
+pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<String> {
+    let rrule_str = schedule.rrule.as_deref()?;
+    let rule: RRule<Unvalidated> = rrule_str.parse().ok()?;
+
+    let hour = rule.get_by_hour().first().copied().unwrap_or(0);
+    let minute = rule.get_by_minute().first().copied().unwrap_or(0);
+    let hm = format!("{hour:02}:{minute:02}");
+    let interval = rule.get_interval();
+
+    Some(match rule.get_freq() {
+        Frequency::Secondly => {
+            let dur = format_duration_human(interval as i64);
             match lang {
                 Language::De => format!("alle {dur}"),
                 Language::En => format!("every {dur}"),
             }
         }
-        RecurrencePattern::Weekly { days, time } => {
-            let hm = format!("{:02}:{:02}", time.hour(), time.minute());
-            if days.len() == 7 {
+        Frequency::Minutely => {
+            let dur = format_duration_human(interval as i64 * 60);
+            match lang {
+                Language::De => format!("alle {dur}"),
+                Language::En => format!("every {dur}"),
+            }
+        }
+        Frequency::Hourly => {
+            let dur = format_duration_human(interval as i64 * 3600);
+            match lang {
+                Language::De => format!("alle {dur}"),
+                Language::En => format!("every {dur}"),
+            }
+        }
+        Frequency::Daily => match (interval, lang) {
+            (1, Language::De) => format!("täglich {hm}"),
+            (1, Language::En) => format!("daily {hm}"),
+            (n, Language::De) => format!("alle {n}d {hm}"),
+            (n, Language::En) => format!("every {n}d {hm}"),
+        },
+        Frequency::Weekly => {
+            let by_weekday = rule.get_by_weekday();
+            let mut day_strs: Vec<&str> = by_weekday
+                .iter()
+                .filter_map(|nw| match nw {
+                    NWeekday::Every(d) => Some(weekday_short(*d, lang)),
+                    NWeekday::Nth(_, d) => Some(weekday_short(*d, lang)),
+                })
+                .collect();
+            if day_strs.is_empty() {
+                day_strs.push("?");
+            }
+            if day_strs.len() == 7 {
                 match lang {
                     Language::De => format!("täglich {hm}"),
                     Language::En => format!("daily {hm}"),
                 }
             } else {
-                let mut sorted = days.clone();
-                sorted.sort_by_key(|d| d.num_days_from_monday());
-                let days_str = sorted
-                    .iter()
-                    .map(|d| weekday_short(*d, lang))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("{days_str} {hm}")
+                format!("{} {hm}", day_strs.join(","))
             }
         }
-        RecurrencePattern::Monthly { day, time } => {
-            let hm = format!("{:02}:{:02}", time.hour(), time.minute());
+        Frequency::Monthly => {
+            let day = rule.get_by_month_day().first().copied().unwrap_or(1);
             match lang {
                 Language::De => format!("jeden {day}. {hm}"),
                 Language::En => format!("monthly on {day}. {hm}"),
             }
         }
-        RecurrencePattern::Yearly { month, day, time } => {
-            let hm = format!("{:02}:{:02}", time.hour(), time.minute());
+        Frequency::Yearly => {
+            let month = rule.get_by_month().first().copied().unwrap_or(1);
+            let day = rule.get_by_month_day().first().copied().unwrap_or(1);
             match lang {
                 Language::De => format!("jährlich {day}.{month}. {hm}"),
                 Language::En => format!(
                     "yearly {day} {} {hm}",
-                    month_name_short(*month as u32, lang)
+                    month_name_short(month as u32, lang)
                 ),
             }
         }
-    }
+    })
 }
 
 /// Compact human-readable duration, e.g. "5min", "2h 30min", "3d 4h".

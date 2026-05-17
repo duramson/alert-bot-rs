@@ -11,5 +11,6 @@ name = "botcore"
 [dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true
+rrule.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -1,243 +1,266 @@
-//! Recurrence patterns for repeating alerts.
+//! Schedule = one anchor + optional RRULE.
 //!
-//! v1 stores `RecurrencePattern` as a serialized string in the `alerts.recurrence`
-//! column but the parser does not yet emit any patterns and the worker treats
-//! every alert as one-shot. v2 will hook the parser, the `next_after`
-//! computation, and the worker re-schedule path.
+//! Replaces the v0.2 custom `RecurrencePattern` enum. We keep the RRULE body
+//! as a string (the canonical RFC-5545 form, minus the `RRULE:` prefix); it
+//! gets re-parsed and re-validated on every expansion call. Cheap, and avoids
+//! the typestate dance of holding `RRule<Validated>` across operations that
+//! conceptually want to rebind `dtstart`.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{DateTime, NaiveTime, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
+use rrule::{Frequency, NWeekday, RRule, RRuleSet, Unvalidated};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Minimum allowed interval for `Interval` recurrence. Anything shorter would
-/// effectively be a notification firehose; users can always re-add later if
-/// the limit lifts.
+/// Minimum allowed interval for recurring alerts. Below this we'd be a
+/// notification firehose; users can always re-add later if the limit lifts.
 pub const MIN_INTERVAL_SECONDS: i64 = 1800;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RecurrencePattern {
-    /// every N seconds (canonical form for any sub-day interval).
-    Interval { seconds: i64 },
-
-    /// e.g. `every mo,mi,fr 09:00`.
-    Weekly { days: Vec<Weekday>, time: NaiveTime },
-
-    /// e.g. `every 1. 10:00` — fires on `day` of every month.
-    Monthly { day: u8, time: NaiveTime },
-
-    /// e.g. `every 24.12 00:00`.
-    Yearly { month: u8, day: u8, time: NaiveTime },
+pub struct Schedule {
+    /// Anchor instant. For one-shots, this *is* the fire time. For recurring,
+    /// it's the original first occurrence (immutable after creation).
+    pub dtstart: DateTime<Utc>,
+    /// Timezone the RRULE's clock-times are interpreted in. Stored per-alert
+    /// so that a future user-tz change doesn't drift existing weekly alerts.
+    pub tz: Tz,
+    /// RFC-5545 RRULE body (without the `RRULE:` prefix). `None` = one-shot.
+    pub rrule: Option<String>,
 }
 
 #[derive(Debug, Error)]
-pub enum RecurrenceError {
-    #[error("invalid recurrence string: {0}")]
+pub enum ScheduleError {
+    #[error("invalid rrule: {0}")]
     Invalid(String),
+    #[error("rrule library error: {0}")]
+    Library(#[from] rrule::RRuleError),
 }
 
-pub trait Recurrence {
-    /// Compute the next fire time strictly after `fired_at` in the user's tz.
-    /// Returns `None` if the recurrence has no further occurrences (e.g. an
-    /// end-date was hit — currently never, reserved for v2).
-    fn next_after(&self, fired_at: DateTime<Utc>, tz: Tz) -> Option<DateTime<Utc>>;
-}
+impl Schedule {
+    /// One-shot schedule. `next_after` returns `Some(dtstart)` while it's in
+    /// the future and `None` afterwards.
+    pub fn one_shot(at: DateTime<Utc>, tz: Tz) -> Self {
+        Self { dtstart: at, tz, rrule: None }
+    }
 
-impl Recurrence for RecurrencePattern {
-    fn next_after(&self, fired_at: DateTime<Utc>, tz: Tz) -> Option<DateTime<Utc>> {
-        match self {
-            Self::Interval { seconds } => Some(fired_at + Duration::seconds(*seconds)),
-            Self::Weekly { days, time } => next_weekly(days, *time, fired_at, tz),
-            Self::Monthly { day, time } => next_monthly(*day, *time, fired_at, tz),
-            Self::Yearly { month, day, time } => next_yearly(*month, *day, *time, fired_at, tz),
+    /// Build a recurring schedule from a constructor-built RRule, validating
+    /// it against `dtstart` and freezing the canonical string form.
+    pub fn recurring(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        rule: RRule<Unvalidated>,
+    ) -> Result<Self, ScheduleError> {
+        let dts_rrule = dtstart.with_timezone(&rrule::Tz::from(tz));
+        let validated = rule.validate(dts_rrule)?;
+        Ok(Self { dtstart, tz, rrule: Some(validated.to_string()) })
+    }
+
+    /// Reconstruct from DB columns.
+    pub fn from_db(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        rrule_str: Option<&str>,
+    ) -> Result<Self, ScheduleError> {
+        match rrule_str {
+            None | Some("") => Ok(Self::one_shot(dtstart, tz)),
+            Some(s) => Ok(Self { dtstart, tz, rrule: Some(s.to_owned()) }),
         }
+    }
+
+    /// First fire strictly after `now`. For one-shot, returns dtstart if it's
+    /// still in the future, else `None`. For recurring, expands the rule.
+    pub fn next_after(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let Some(rrule_str) = self.rrule.as_deref() else {
+            return (self.dtstart > now).then_some(self.dtstart);
+        };
+
+        let rule: RRule<Unvalidated> = rrule_str.parse().ok()?;
+        let dts = self.dtstart.with_timezone(&rrule::Tz::from(self.tz));
+        let validated = rule.validate(dts).ok()?;
+        let now_tz = now.with_timezone(&rrule::Tz::from(self.tz));
+
+        // rrule's `after()` is *inclusive* — passing now=T would return the
+        // T occurrence itself. We want strictly-after, so fetch a couple and
+        // filter. limit=4 is enough to skip the exact-match plus give buffer.
+        let set = RRuleSet::new(dts).rrule(validated).after(now_tz);
+        set.all(4)
+            .dates
+            .into_iter()
+            .map(|d| d.with_timezone(&Utc))
+            .find(|d| *d > now)
+    }
+
+    pub fn is_recurring(&self) -> bool {
+        self.rrule.is_some()
     }
 }
 
-/// Find the next occurrence of any weekday in `days` at `time`, strictly
-/// after `fired_at`. Walks at most 8 days forward (covers a full week + today).
-fn next_weekly(
-    days: &[Weekday],
-    time: NaiveTime,
-    fired_at: DateTime<Utc>,
-    tz: Tz,
-) -> Option<DateTime<Utc>> {
-    if days.is_empty() {
-        return None;
-    }
-    let local_today = fired_at.with_timezone(&tz).date_naive();
-    for offset in 0..=7 {
-        let date = local_today.checked_add_days(chrono::Days::new(offset))?;
-        if !days.contains(&date.weekday()) {
-            continue;
-        }
-        if let Some(candidate) = local_to_utc_lenient(date, time, tz) {
-            if candidate > fired_at {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
+// ===========================================================================
+// Constructors that map our domain patterns onto RRULE
+// ===========================================================================
 
-/// Next occurrence of `day` of any future month, at `time`.
-/// Skips months that don't have that day (e.g. Feb 31).
-fn next_monthly(
-    day: u8,
-    time: NaiveTime,
-    fired_at: DateTime<Utc>,
-    tz: Tz,
-) -> Option<DateTime<Utc>> {
-    let local_now = fired_at.with_timezone(&tz);
-    let mut year = local_now.year();
-    let mut month = local_now.month();
-    // Up to 14 attempts handles "every 31st" → Feb/Apr/Jun/Sep/Nov skips.
-    for _ in 0..14 {
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day as u32) {
-            if let Some(candidate) = local_to_utc_lenient(date, time, tz) {
-                if candidate > fired_at {
-                    return Some(candidate);
-                }
-            }
+impl Schedule {
+    /// Sub-day interval (`*30m`, `*3h`) → `FREQ={MINUTELY|HOURLY};INTERVAL=N`.
+    /// Rejects intervals shorter than `MIN_INTERVAL_SECONDS`.
+    pub fn interval_seconds(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        seconds: i64,
+    ) -> Result<Self, ScheduleError> {
+        if seconds < MIN_INTERVAL_SECONDS {
+            return Err(ScheduleError::Invalid(format!(
+                "interval {seconds}s below minimum {MIN_INTERVAL_SECONDS}s"
+            )));
         }
-        if month == 12 {
-            year += 1;
-            month = 1;
+        let rule = if seconds % 3600 == 0 {
+            RRule::new(Frequency::Hourly).interval((seconds / 3600) as u16)
+        } else if seconds % 60 == 0 {
+            RRule::new(Frequency::Minutely).interval((seconds / 60) as u16)
         } else {
-            month += 1;
-        }
+            RRule::new(Frequency::Secondly).interval(seconds as u16)
+        };
+        Self::recurring(dtstart, tz, rule)
     }
-    None
+
+    /// Daily at fixed wall-clock time, every N days (DST-safe).
+    /// `*1d 09:00` = `every_n_days=1, time=09:00`.
+    pub fn daily_at(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        every_n_days: u16,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        let rule = RRule::new(Frequency::Daily)
+            .interval(every_n_days)
+            .by_hour(vec![time.hour() as u8])
+            .by_minute(vec![time.minute() as u8]);
+        Self::recurring(dtstart, tz, rule)
+    }
+
+    /// Weekly on given weekday(s) at fixed wall-clock time.
+    pub fn weekly(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        days: &[Weekday],
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        let by_weekday: Vec<NWeekday> = days.iter().map(|w| NWeekday::Every(*w)).collect();
+        let rule = RRule::new(Frequency::Weekly)
+            .by_weekday(by_weekday)
+            .by_hour(vec![time.hour() as u8])
+            .by_minute(vec![time.minute() as u8]);
+        Self::recurring(dtstart, tz, rule)
+    }
+
+    /// Monthly on a given day-of-month at fixed wall-clock time.
+    /// Months without that day fire on the last day (RRULE BYMONTHDAY=-1
+    /// would do that natively; for simplicity we just use the positive day
+    /// and let the expander skip — see TODO below for the user-visible hint).
+    pub fn monthly(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        day: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        let rule = RRule::new(Frequency::Monthly)
+            .by_month_day(vec![day as i8])
+            .by_hour(vec![time.hour() as u8])
+            .by_minute(vec![time.minute() as u8]);
+        Self::recurring(dtstart, tz, rule)
+    }
+
+    /// Yearly on a fixed month + day-of-month at fixed wall-clock time.
+    pub fn yearly(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        month: u8,
+        day: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        let chrono_month = chrono::Month::try_from(month)
+            .map_err(|_| ScheduleError::Invalid(format!("invalid month {month}")))?;
+        let rule = RRule::new(Frequency::Yearly)
+            .by_month(&[chrono_month])
+            .by_month_day(vec![day as i8])
+            .by_hour(vec![time.hour() as u8])
+            .by_minute(vec![time.minute() as u8]);
+        Self::recurring(dtstart, tz, rule)
+    }
 }
 
-/// Next occurrence of `month-day` at `time` in any future year.
-/// Handles Feb 29 by skipping non-leap years.
-fn next_yearly(
-    month: u8,
-    day: u8,
-    time: NaiveTime,
-    fired_at: DateTime<Utc>,
+// ===========================================================================
+// Legacy v0.2 deserialization — read-only, dropped in a follow-up migration
+// once all rows are upgraded.
+// ===========================================================================
+
+/// Parse a v0.2 `recurrence` column value (`interval:1800`, `weekly:1,3,5:09:00`,
+/// `monthly:15:18:00`, `yearly:12-24:09:00`) into a Schedule using the given
+/// anchor + tz. Returns Ok(None) if the input is empty/NULL-like.
+pub fn schedule_from_legacy(
+    legacy: &str,
+    dtstart: DateTime<Utc>,
     tz: Tz,
-) -> Option<DateTime<Utc>> {
-    let local_now = fired_at.with_timezone(&tz);
-    let mut year = local_now.year();
-    for _ in 0..5 {
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month as u32, day as u32) {
-            if let Some(candidate) = local_to_utc_lenient(date, time, tz) {
-                if candidate > fired_at {
-                    return Some(candidate);
-                }
-            }
-        }
-        year += 1;
+) -> Result<Option<Schedule>, ScheduleError> {
+    if legacy.is_empty() {
+        return Ok(None);
     }
-    None
-}
+    let (kind, rest) = legacy
+        .split_once(':')
+        .ok_or_else(|| ScheduleError::Invalid(format!("legacy: missing ':' in {legacy:?}")))?;
 
-/// Same DST-handling policy the parser uses: pick the earlier of two
-/// ambiguous instants, advance by one hour out of a DST gap.
-fn local_to_utc_lenient(date: NaiveDate, time: NaiveTime, tz: Tz) -> Option<DateTime<Utc>> {
-    let naive = date.and_time(time);
-    match tz.from_local_datetime(&naive) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
-        chrono::LocalResult::Ambiguous(earlier, _) => Some(earlier.with_timezone(&Utc)),
-        chrono::LocalResult::None => {
-            // Spring-forward gap; bump 1h and retry.
-            let bumped = naive + Duration::hours(1);
-            tz.from_local_datetime(&bumped)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
+    let s = match kind {
+        "interval" => {
+            let secs: i64 = rest
+                .parse()
+                .map_err(|_| ScheduleError::Invalid(format!("legacy interval: {rest:?}")))?;
+            Schedule::interval_seconds(dtstart, tz, secs)?
         }
-    }
-}
-
-/// Compact serialization used by the `alerts.recurrence` text column.
-///
-/// Format: `interval:<secs>` | `weekly:<days>:<HH:MM>` | `monthly:<day>:<HH:MM>` | `yearly:<MM>-<DD>:<HH:MM>`
-/// where `<days>` is comma-separated weekday numbers (mon=1 .. sun=7, ISO).
-impl RecurrencePattern {
-    pub fn serialize(&self) -> String {
-        match self {
-            Self::Interval { seconds } => format!("interval:{seconds}"),
-            Self::Weekly { days, time } => {
-                let days = days
-                    .iter()
-                    .map(|d| d.number_from_monday().to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("weekly:{days}:{}", time.format("%H:%M"))
-            }
-            Self::Monthly { day, time } => {
-                format!("monthly:{day}:{}", time.format("%H:%M"))
-            }
-            Self::Yearly { month, day, time } => {
-                format!("yearly:{month:02}-{day:02}:{}", time.format("%H:%M"))
-            }
+        "weekly" => {
+            let (days_str, time_str) = rest.split_once(':').ok_or_else(|| {
+                ScheduleError::Invalid(format!("legacy weekly: missing time in {legacy:?}"))
+            })?;
+            let days: Vec<Weekday> = days_str
+                .split(',')
+                .map(|n| n.parse::<u32>().ok().and_then(weekday_from_iso))
+                .collect::<Option<_>>()
+                .ok_or_else(|| ScheduleError::Invalid(format!("legacy weekly days: {days_str:?}")))?;
+            let time = NaiveTime::parse_from_str(time_str, "%H:%M")
+                .map_err(|_| ScheduleError::Invalid(format!("legacy weekly time: {time_str:?}")))?;
+            Schedule::weekly(dtstart, tz, &days, time)?
         }
-    }
-
-    pub fn deserialize(s: &str) -> Result<Self, RecurrenceError> {
-        // Hand-rolled to avoid pulling serde-string dependencies into core.
-        let mut parts = s.splitn(2, ':');
-        let kind = parts.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-        let rest = parts.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-        match kind {
-            "interval" => {
-                let seconds: i64 = rest
-                    .parse()
-                    .map_err(|_| RecurrenceError::Invalid(s.into()))?;
-                Ok(Self::Interval { seconds })
-            }
-            "weekly" => {
-                let mut sub = rest.splitn(2, ':');
-                let days_str = sub.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let time_str = sub.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let days = days_str
-                    .split(',')
-                    .map(|d| {
-                        d.parse::<u32>()
-                            .ok()
-                            .and_then(weekday_from_iso)
-                            .ok_or_else(|| RecurrenceError::Invalid(s.into()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let time = NaiveTime::parse_from_str(time_str, "%H:%M")
-                    .map_err(|_| RecurrenceError::Invalid(s.into()))?;
-                Ok(Self::Weekly { days, time })
-            }
-            "monthly" => {
-                let mut sub = rest.splitn(2, ':');
-                let day: u8 = sub
-                    .next()
-                    .and_then(|d| d.parse().ok())
-                    .ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let time = NaiveTime::parse_from_str(
-                    sub.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?,
-                    "%H:%M",
-                )
-                .map_err(|_| RecurrenceError::Invalid(s.into()))?;
-                Ok(Self::Monthly { day, time })
-            }
-            "yearly" => {
-                let mut sub = rest.splitn(2, ':');
-                let date = sub.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let time_str = sub.next().ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let mut date_parts = date.split('-');
-                let month: u8 = date_parts
-                    .next()
-                    .and_then(|m| m.parse().ok())
-                    .ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let day: u8 = date_parts
-                    .next()
-                    .and_then(|d| d.parse().ok())
-                    .ok_or_else(|| RecurrenceError::Invalid(s.into()))?;
-                let time = NaiveTime::parse_from_str(time_str, "%H:%M")
-                    .map_err(|_| RecurrenceError::Invalid(s.into()))?;
-                Ok(Self::Yearly { month, day, time })
-            }
-            _ => Err(RecurrenceError::Invalid(s.into())),
+        "monthly" => {
+            let (day_str, time_str) = rest.split_once(':').ok_or_else(|| {
+                ScheduleError::Invalid(format!("legacy monthly: missing time in {legacy:?}"))
+            })?;
+            let day: u8 = day_str
+                .parse()
+                .map_err(|_| ScheduleError::Invalid(format!("legacy monthly day: {day_str:?}")))?;
+            let time = NaiveTime::parse_from_str(time_str, "%H:%M")
+                .map_err(|_| ScheduleError::Invalid(format!("legacy monthly time: {time_str:?}")))?;
+            Schedule::monthly(dtstart, tz, day, time)?
         }
-    }
+        "yearly" => {
+            let (date_str, time_str) = rest.split_once(':').ok_or_else(|| {
+                ScheduleError::Invalid(format!("legacy yearly: missing time in {legacy:?}"))
+            })?;
+            let (m, d) = date_str.split_once('-').ok_or_else(|| {
+                ScheduleError::Invalid(format!("legacy yearly date: {date_str:?}"))
+            })?;
+            let month: u8 = m
+                .parse()
+                .map_err(|_| ScheduleError::Invalid(format!("legacy yearly month: {m:?}")))?;
+            let day: u8 = d
+                .parse()
+                .map_err(|_| ScheduleError::Invalid(format!("legacy yearly day: {d:?}")))?;
+            let time = NaiveTime::parse_from_str(time_str, "%H:%M")
+                .map_err(|_| ScheduleError::Invalid(format!("legacy yearly time: {time_str:?}")))?;
+            Schedule::yearly(dtstart, tz, month, day, time)?
+        }
+        other => {
+            return Err(ScheduleError::Invalid(format!("legacy unknown kind: {other:?}")));
+        }
+    };
+    Ok(Some(s))
 }
 
 fn weekday_from_iso(n: u32) -> Option<Weekday> {
@@ -253,149 +276,192 @@ fn weekday_from_iso(n: u32) -> Option<Weekday> {
     }
 }
 
+// ===========================================================================
+// Tests
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn berlin() -> Tz {
         "Europe/Berlin".parse().unwrap()
     }
-
     fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, 0).unwrap()
     }
-
     fn local(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
         berlin()
             .with_ymd_and_hms(year, month, day, hour, minute, 0)
             .unwrap()
             .with_timezone(&Utc)
     }
-
     fn t(h: u32, m: u32) -> NaiveTime {
         NaiveTime::from_hms_opt(h, m, 0).unwrap()
     }
 
+    // ---- One-shot ----
+
     #[test]
-    fn interval_roundtrip() {
-        let p = RecurrencePattern::Interval { seconds: 86400 };
-        assert_eq!(RecurrencePattern::deserialize(&p.serialize()).unwrap(), p);
+    fn one_shot_future_returns_dtstart() {
+        let s = Schedule::one_shot(utc(2026, 5, 9, 14, 0), berlin());
+        assert_eq!(s.next_after(utc(2026, 5, 9, 13, 0)), Some(utc(2026, 5, 9, 14, 0)));
     }
 
     #[test]
-    fn weekly_roundtrip() {
-        let p = RecurrencePattern::Weekly {
-            days: vec![Weekday::Mon, Weekday::Wed, Weekday::Fri],
-            time: t(9, 0),
-        };
-        assert_eq!(RecurrencePattern::deserialize(&p.serialize()).unwrap(), p);
-    }
-
-    #[test]
-    fn yearly_roundtrip() {
-        let p = RecurrencePattern::Yearly {
-            month: 12,
-            day: 24,
-            time: t(0, 0),
-        };
-        assert_eq!(RecurrencePattern::deserialize(&p.serialize()).unwrap(), p);
-    }
-
-    // ---- Weekly next_after ----
-
-    #[test]
-    fn weekly_today_time_still_ahead_picks_today() {
-        // Friday 2026-05-08 08:00 Berlin → next Friday 09:00 today
-        let pattern = RecurrencePattern::Weekly {
-            days: vec![Weekday::Fri],
-            time: t(9, 0),
-        };
-        let from = local(2026, 5, 8, 8, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 5, 8, 9, 0)));
-    }
-
-    #[test]
-    fn weekly_today_time_already_passed_picks_next_week() {
-        // Friday 2026-05-08 10:00 → next Friday is 2026-05-15 09:00
-        let pattern = RecurrencePattern::Weekly {
-            days: vec![Weekday::Fri],
-            time: t(9, 0),
-        };
-        let from = local(2026, 5, 8, 10, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 5, 15, 9, 0)));
-    }
-
-    #[test]
-    fn weekly_multi_day_picks_nearest() {
-        // Friday 2026-05-08 → Mo,Mi,Fr → today already past 9:00 so next Mon 11.5.
-        let pattern = RecurrencePattern::Weekly {
-            days: vec![Weekday::Mon, Weekday::Wed, Weekday::Fri],
-            time: t(9, 0),
-        };
-        let from = local(2026, 5, 8, 10, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 5, 11, 9, 0)));
-    }
-
-    #[test]
-    fn weekly_exact_time_skips_to_next() {
-        // Strictly-after: firing exactly at the same instant should jump to the
-        // next slot, not return the same time again.
-        let pattern = RecurrencePattern::Weekly {
-            days: vec![Weekday::Mon],
-            time: t(9, 0),
-        };
-        let from = local(2026, 5, 4, 9, 0); // Mon 09:00 Berlin
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 5, 11, 9, 0)));
-    }
-
-    // ---- Monthly next_after ----
-
-    #[test]
-    fn monthly_first_of_month_today_ahead() {
-        // Mid-month, "every 1st 09:00" → next month's 1st
-        let pattern = RecurrencePattern::Monthly { day: 1, time: t(9, 0) };
-        let from = local(2026, 5, 8, 12, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 6, 1, 9, 0)));
-    }
-
-    #[test]
-    fn monthly_skips_short_months() {
-        // "every 31st 09:00" starting Jan 31 → skips Feb (no 31), Mar 31 next.
-        let pattern = RecurrencePattern::Monthly { day: 31, time: t(9, 0) };
-        let from = local(2026, 1, 31, 10, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 3, 31, 9, 0)));
-    }
-
-    // ---- Yearly next_after ----
-
-    #[test]
-    fn yearly_christmas() {
-        let pattern = RecurrencePattern::Yearly { month: 12, day: 24, time: t(9, 0) };
-        let from = local(2026, 5, 8, 12, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2026, 12, 24, 9, 0)));
-    }
-
-    #[test]
-    fn yearly_after_anniversary_rolls_to_next_year() {
-        let pattern = RecurrencePattern::Yearly { month: 4, day: 30, time: t(9, 0) };
-        let from = local(2026, 5, 8, 12, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2027, 4, 30, 9, 0)));
-    }
-
-    #[test]
-    fn yearly_feb29_skips_non_leap() {
-        // 2026 is not a leap year; Feb 29 next valid in 2028.
-        let pattern = RecurrencePattern::Yearly { month: 2, day: 29, time: t(0, 0) };
-        let from = utc(2026, 5, 8, 12, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(local(2028, 2, 29, 0, 0)));
+    fn one_shot_past_returns_none() {
+        let s = Schedule::one_shot(utc(2026, 5, 9, 14, 0), berlin());
+        assert_eq!(s.next_after(utc(2026, 5, 9, 15, 0)), None);
     }
 
     // ---- Interval ----
 
     #[test]
-    fn interval_is_simple_addition() {
-        let pattern = RecurrencePattern::Interval { seconds: 1800 };
-        let from = utc(2026, 5, 8, 10, 0);
-        assert_eq!(pattern.next_after(from, berlin()), Some(utc(2026, 5, 8, 10, 30)));
+    fn interval_30m_next_is_dtstart_plus_30() {
+        let dts = utc(2026, 5, 9, 10, 0);
+        let s = Schedule::interval_seconds(dts, berlin(), 1800).unwrap();
+        // strictly after dts → next slot is dts + 30m
+        assert_eq!(s.next_after(dts), Some(utc(2026, 5, 9, 10, 30)));
+    }
+
+    #[test]
+    fn interval_below_minimum_rejected() {
+        let dts = utc(2026, 5, 9, 10, 0);
+        let err = Schedule::interval_seconds(dts, berlin(), 60).unwrap_err();
+        assert!(matches!(err, ScheduleError::Invalid(_)));
+    }
+
+    // ---- Daily ----
+
+    #[test]
+    fn daily_picks_today_if_time_still_ahead() {
+        let dts = local(2026, 5, 9, 9, 0);
+        let s = Schedule::daily_at(dts, berlin(), 1, t(9, 0)).unwrap();
+        // Asking at 08:00 today → today 09:00 (which equals dtstart)
+        assert_eq!(s.next_after(local(2026, 5, 9, 8, 0)), Some(local(2026, 5, 9, 9, 0)));
+    }
+
+    #[test]
+    fn daily_picks_tomorrow_if_time_passed() {
+        let dts = local(2026, 5, 9, 9, 0);
+        let s = Schedule::daily_at(dts, berlin(), 1, t(9, 0)).unwrap();
+        // Asking at 10:00 → tomorrow 09:00
+        assert_eq!(
+            s.next_after(local(2026, 5, 9, 10, 0)),
+            Some(local(2026, 5, 10, 9, 0))
+        );
+    }
+
+    #[test]
+    fn every_2_days_at_11() {
+        let dts = local(2026, 5, 9, 11, 0);
+        let s = Schedule::daily_at(dts, berlin(), 2, t(11, 0)).unwrap();
+        // Right after dtstart → +2 days
+        assert_eq!(
+            s.next_after(local(2026, 5, 9, 11, 1)),
+            Some(local(2026, 5, 11, 11, 0))
+        );
+    }
+
+    // ---- Weekly ----
+
+    #[test]
+    fn weekly_mon_wed_fri() {
+        // Anchor on a Friday (2026-05-08); next "after Fri 10:00" with rule
+        // Mon/Wed/Fri 09:00 is next Monday (2026-05-11).
+        let dts = local(2026, 5, 8, 9, 0);
+        let s = Schedule::weekly(
+            dts,
+            berlin(),
+            &[Weekday::Mon, Weekday::Wed, Weekday::Fri],
+            t(9, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            s.next_after(local(2026, 5, 8, 10, 0)),
+            Some(local(2026, 5, 11, 9, 0))
+        );
+    }
+
+    // ---- Yearly ----
+
+    #[test]
+    fn yearly_christmas() {
+        let dts = local(2026, 12, 24, 9, 0);
+        let s = Schedule::yearly(dts, berlin(), 12, 24, t(9, 0)).unwrap();
+        // Right after this year's → next year's
+        assert_eq!(
+            s.next_after(local(2026, 12, 24, 10, 0)),
+            Some(local(2027, 12, 24, 9, 0))
+        );
+    }
+
+    // ---- RRULE round-trip via string ----
+
+    #[test]
+    fn rrule_string_is_valid_rfc5545_subset() {
+        let s = Schedule::weekly(
+            local(2026, 5, 8, 9, 0),
+            berlin(),
+            &[Weekday::Mon, Weekday::Wed, Weekday::Fri],
+            t(9, 0),
+        )
+        .unwrap();
+        let rule_str = s.rrule.as_deref().unwrap();
+        assert!(rule_str.starts_with("FREQ=WEEKLY"));
+        assert!(rule_str.contains("BYDAY=MO,WE,FR"));
+        assert!(rule_str.contains("BYHOUR=9"));
+        assert!(rule_str.contains("BYMINUTE=0"));
+    }
+
+    #[test]
+    fn schedule_from_db_round_trips() {
+        let original = Schedule::daily_at(local(2026, 5, 9, 9, 0), berlin(), 2, t(11, 0)).unwrap();
+        let restored = Schedule::from_db(
+            original.dtstart,
+            original.tz,
+            original.rrule.as_deref(),
+        )
+        .unwrap();
+        // Both should give the same next_after.
+        let probe = local(2026, 5, 9, 11, 1);
+        assert_eq!(original.next_after(probe), restored.next_after(probe));
+    }
+
+    // ---- Legacy migration ----
+
+    #[test]
+    fn legacy_weekly_converts() {
+        // Old format: "weekly:1,3,5:09:00" = Mon/Wed/Fri at 09:00
+        let dts = local(2026, 5, 8, 9, 0);
+        let s = schedule_from_legacy("weekly:1,3,5:09:00", dts, berlin())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.next_after(local(2026, 5, 8, 10, 0)),
+            Some(local(2026, 5, 11, 9, 0))
+        );
+    }
+
+    #[test]
+    fn legacy_interval_converts() {
+        let dts = utc(2026, 5, 9, 10, 0);
+        let s = schedule_from_legacy("interval:1800", dts, berlin())
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.next_after(dts), Some(utc(2026, 5, 9, 10, 30)));
+    }
+
+    #[test]
+    fn legacy_yearly_converts() {
+        let dts = local(2026, 12, 24, 9, 0);
+        let s = schedule_from_legacy("yearly:12-24:09:00", dts, berlin())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.next_after(local(2026, 12, 24, 10, 0)),
+            Some(local(2027, 12, 24, 9, 0))
+        );
     }
 }

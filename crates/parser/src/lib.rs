@@ -23,7 +23,7 @@ use thiserror::Error;
 mod keywords;
 
 pub use botcore::recurrence::MIN_INTERVAL_SECONDS;
-pub use botcore::{Language, RecurrencePattern};
+pub use botcore::{Language, Schedule, ScheduleError};
 
 /// Default time-of-day for named-day expressions without an explicit clock,
 /// e.g. `morgen Arzt` → tomorrow at 09:00 local time.
@@ -41,16 +41,22 @@ pub struct ParseContext {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Parsed {
-    /// Resolved fire time in UTC. For recurring alerts, this is the *first*
-    /// occurrence — `recurrence` carries the rule for subsequent ones.
-    pub fire_at: DateTime<Utc>,
+    /// Resolved schedule. For one-shots, `schedule.dtstart` is the only fire
+    /// time. For recurring, `dtstart` is the first occurrence; subsequent
+    /// fires are derived via the embedded RRULE.
+    pub schedule: Schedule,
     /// Reminder text — everything after the time expression, trimmed.
     pub text: String,
     /// `true` if the user gave an explicit clock time (e.g. `14:00`),
     /// `false` if we filled in `DEFAULT_TIME`.
     pub had_explicit_time: bool,
-    /// Some when the spec was recurring (`*`, `every`, `alle`, `jeden`, `jede`).
-    pub recurrence: Option<RecurrencePattern>,
+}
+
+impl Parsed {
+    /// Convenience for handlers that still think in terms of the first fire.
+    pub fn fire_at(&self) -> DateTime<Utc> {
+        self.schedule.dtstart
+    }
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -71,6 +77,19 @@ pub enum ParseError {
     IntervalTooShort(i64),
     #[error("this kind of spec can't recur")]
     InvalidRecurrenceSpec,
+    #[error("rrule error: {0}")]
+    Rrule(String),
+}
+
+impl From<ScheduleError> for ParseError {
+    fn from(e: ScheduleError) -> Self {
+        match e {
+            ScheduleError::Invalid(s) if s.starts_with("interval ") => {
+                ParseError::IntervalTooShort(MIN_INTERVAL_SECONDS)
+            }
+            other => ParseError::Rrule(other.to_string()),
+        }
+    }
 }
 
 mod grammar;
@@ -141,7 +160,7 @@ mod tests {
         let r = p("5m Kaffee fertig");
         assert_eq!(r.text, "Kaffee fertig");
         assert_eq!(
-            r.fire_at,
+            r.fire_at(),
             ctx(Language::De).now_utc + chrono::Duration::minutes(5)
         );
         assert!(r.had_explicit_time);
@@ -152,7 +171,7 @@ mod tests {
         let r = p("30 minuten Pizza");
         assert_eq!(r.text, "Pizza");
         assert_eq!(
-            r.fire_at,
+            r.fire_at(),
             ctx(Language::De).now_utc + chrono::Duration::minutes(30)
         );
     }
@@ -162,7 +181,7 @@ mod tests {
         let r = p("in 2 stunden trinken");
         assert_eq!(r.text, "trinken");
         assert_eq!(
-            r.fire_at,
+            r.fire_at(),
             ctx(Language::De).now_utc + chrono::Duration::hours(2)
         );
     }
@@ -172,7 +191,7 @@ mod tests {
         let r = p("30d abo kündigen");
         assert_eq!(r.text, "abo kündigen");
         assert_eq!(
-            r.fire_at,
+            r.fire_at(),
             ctx(Language::De).now_utc + chrono::Duration::days(30)
         );
     }
@@ -194,7 +213,7 @@ mod tests {
             .with_ymd_and_hms(2027, 4, 30, 9, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
         assert!(!r.had_explicit_time);
     }
 
@@ -207,7 +226,7 @@ mod tests {
             .with_ymd_and_hms(2027, 4, 30, 14, 30, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
         assert!(r.had_explicit_time);
     }
 
@@ -220,7 +239,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 10, 9, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     // ---- Named day ----
@@ -233,7 +252,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 9, 9, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
         assert_eq!(r.text, "Arzt");
         assert!(r.had_explicit_time);
     }
@@ -246,7 +265,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 9, 9, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
         assert!(!r.had_explicit_time);
     }
 
@@ -258,7 +277,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 10, 14, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     #[test]
@@ -270,7 +289,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 14, 14, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     #[test]
@@ -282,7 +301,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 11, 10, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     #[test]
@@ -296,7 +315,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 8, 14, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     #[test]
@@ -308,7 +327,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 15, 9, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     #[test]
@@ -321,7 +340,7 @@ mod tests {
             .with_ymd_and_hms(2026, 5, 15, 9, 0, 0)
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(r.fire_at, expected);
+        assert_eq!(r.fire_at(), expected);
     }
 
     // ---- Fuzzy matching ----
@@ -366,23 +385,22 @@ mod tests {
     }
 
     // ============================================================
-    // Recurring
+    // Recurring — assert via Schedule's rrule string + dtstart, since the
+    // pattern enum is gone. RRULE strings are stable RFC-5545 output.
     // ============================================================
 
-    use chrono::{NaiveTime, Weekday};
-
-    fn nt(h: u32, m: u32) -> NaiveTime {
-        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    fn rrule(r: &Parsed) -> &str {
+        r.schedule.rrule.as_deref().expect("expected recurring")
     }
 
     #[test]
     fn rec_short_interval_30m() {
         let r = p("*30m wasser trinken");
         assert_eq!(r.text, "wasser trinken");
-        assert_eq!(r.recurrence, Some(RecurrencePattern::Interval { seconds: 1800 }));
-        // First fire = now + 30min.
+        assert!(rrule(&r).contains("FREQ=MINUTELY"));
+        assert!(rrule(&r).contains("INTERVAL=30"));
         assert_eq!(
-            r.fire_at,
+            r.fire_at(),
             ctx(Language::De).now_utc + chrono::Duration::minutes(30)
         );
     }
@@ -391,7 +409,8 @@ mod tests {
     fn rec_long_interval_30m() {
         let r = p("alle 30m wasser trinken");
         assert_eq!(r.text, "wasser trinken");
-        assert_eq!(r.recurrence, Some(RecurrencePattern::Interval { seconds: 1800 }));
+        assert!(rrule(&r).contains("FREQ=MINUTELY"));
+        assert!(rrule(&r).contains("INTERVAL=30"));
     }
 
     #[test]
@@ -404,120 +423,90 @@ mod tests {
     fn rec_daily_short() {
         let r = p("*1d vitamin");
         assert_eq!(r.text, "vitamin");
-        // Daily = Weekly all-days at default time
-        match r.recurrence.as_ref().unwrap() {
-            RecurrencePattern::Weekly { days, time } => {
-                assert_eq!(days.len(), 7);
-                assert_eq!(*time, nt(9, 0));
-            }
-            other => panic!("expected Weekly all-days, got {other:?}"),
-        }
+        assert!(rrule(&r).contains("FREQ=DAILY"));
+        assert!(rrule(&r).contains("BYHOUR=9"));
+        assert!(rrule(&r).contains("BYMINUTE=0"));
     }
 
     #[test]
     fn rec_weekly_single_day_long() {
         let r = p("jeden donnerstag 14:00 standup");
         assert_eq!(r.text, "standup");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Weekly {
-                days: vec![Weekday::Thu],
-                time: nt(14, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=WEEKLY"));
+        assert!(s.contains("BYDAY=TH"));
+        assert!(s.contains("BYHOUR=14"));
     }
 
     #[test]
     fn rec_weekly_short_with_time() {
         let r = p("*do 14:00 standup");
         assert_eq!(r.text, "standup");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Weekly {
-                days: vec![Weekday::Thu],
-                time: nt(14, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=WEEKLY"));
+        assert!(s.contains("BYDAY=TH"));
+        assert!(s.contains("BYHOUR=14"));
     }
 
     #[test]
     fn rec_weekly_multi_day_with_comma() {
         let r = p("*mo,mi,fr 9 yoga");
         assert_eq!(r.text, "yoga");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Weekly {
-                days: vec![Weekday::Mon, Weekday::Wed, Weekday::Fri],
-                time: nt(9, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=WEEKLY"));
+        assert!(s.contains("BYDAY=MO,WE,FR"));
+        assert!(s.contains("BYHOUR=9"));
     }
 
     #[test]
     fn rec_weekly_default_time() {
         let r = p("jeden montag yoga");
         assert_eq!(r.text, "yoga");
-        match r.recurrence.as_ref().unwrap() {
-            RecurrencePattern::Weekly { days, time } => {
-                assert_eq!(days, &vec![Weekday::Mon]);
-                assert_eq!(*time, nt(9, 0));
-            }
-            other => panic!("expected Weekly, got {other:?}"),
-        }
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=WEEKLY"));
+        assert!(s.contains("BYDAY=MO"));
+        assert!(s.contains("BYHOUR=9"));
     }
 
     #[test]
     fn rec_monthly_first() {
         let r = p("*1. miete bezahlen");
         assert_eq!(r.text, "miete bezahlen");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Monthly {
-                day: 1,
-                time: nt(9, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=MONTHLY"));
+        assert!(s.contains("BYMONTHDAY=1"));
+        assert!(s.contains("BYHOUR=9"));
     }
 
     #[test]
     fn rec_monthly_with_time() {
         let r = p("jeden 15. 18:00 abrechnung");
         assert_eq!(r.text, "abrechnung");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Monthly {
-                day: 15,
-                time: nt(18, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=MONTHLY"));
+        assert!(s.contains("BYMONTHDAY=15"));
+        assert!(s.contains("BYHOUR=18"));
     }
 
     #[test]
     fn rec_yearly_short() {
         let r = p("*24.12 heiligabend");
         assert_eq!(r.text, "heiligabend");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Yearly {
-                month: 12,
-                day: 24,
-                time: nt(9, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=YEARLY"));
+        assert!(s.contains("BYMONTH=12"));
+        assert!(s.contains("BYMONTHDAY=24"));
+        assert!(s.contains("BYHOUR=9"));
     }
 
     #[test]
     fn rec_yearly_long_en() {
         let r = p_en("every 24.12 christmas");
         assert_eq!(r.text, "christmas");
-        assert_eq!(
-            r.recurrence,
-            Some(RecurrencePattern::Yearly {
-                month: 12,
-                day: 24,
-                time: nt(9, 0),
-            })
-        );
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=YEARLY"));
+        assert!(s.contains("BYMONTH=12"));
+        assert!(s.contains("BYMONTHDAY=24"));
     }
 
     #[test]

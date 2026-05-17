@@ -100,16 +100,13 @@ async fn create_alert(
         chat_type,
         scope,
         text: parsed.text.clone(),
-        fire_at: parsed.fire_at,
-        recurrence: parsed.recurrence.clone(),
+        fire_at: parsed.fire_at(),
+        schedule: parsed.schedule.clone(),
     };
     let alert = store.create_alert(new).await?;
 
     let when = render::format_local_short(alert.fire_at, user.timezone, user.language);
-    let recurrence_short = alert
-        .recurrence
-        .as_ref()
-        .map(|r| render::format_recurrence_short(r, user.language));
+    let recurrence_short = render::format_recurrence_short(&alert.schedule, user.language);
     let recurrence_str = recurrence_short.as_deref();
     let reply = match scope {
         AlertScope::Private => m::alert_confirmation(user.language, &when, alert.id, recurrence_str),
@@ -189,9 +186,8 @@ async fn list(
         };
         let when = render::format_local_compact(a.fire_at, tz, lang);
         let text = html_escape(&a.text);
-        let line = match a.recurrence.as_ref() {
-            Some(rec) => {
-                let rec_short = render::format_recurrence_short(rec, lang);
+        let line = match render::format_recurrence_short(&a.schedule, lang) {
+            Some(rec_short) => {
                 format!("\n{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
             }
             None => format!("\n{scope_icon} #{} · {when} · {text}", a.id),

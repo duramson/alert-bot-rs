@@ -36,6 +36,10 @@ chrono-tz = { version = "0.10", features = ["serde"] }
 # Parser
 strsim = "0.11"
 
+# iCalendar RRULE — single source of truth for recurrence semantics.
+# Parser builds RRules; storage serialises them as RFC-5545 strings.
+rrule = "0.14"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

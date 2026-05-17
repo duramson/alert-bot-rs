@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use botcore::{Alert, Language, Recurrence};
+use botcore::{Alert, Language};
 use storage::PgStore;
 
 use crate::messages as m;
@@ -145,20 +145,13 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
 /// to *now* (skipping any missed occurrences during downtime so we don't fire
 /// the past N intervals back-to-back) and reschedule. Otherwise mark sent.
 async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<()> {
-    let Some(rec) = alert.recurrence.as_ref() else {
+    if !alert.schedule.is_recurring() {
         store.mark_sent(alert.id).await?;
         return Ok(());
-    };
-
-    // Look up creator timezone so weekly/monthly/yearly resolve correctly.
-    let tz = store
-        .get_user(alert.user_id)
-        .await?
-        .map(|u| u.timezone)
-        .unwrap_or(chrono_tz::UTC);
+    }
 
     let now = Utc::now();
-    match rec.next_after(now, tz) {
+    match alert.schedule.next_after(now) {
         Some(next) => store.reschedule(alert.id, next).await?,
         None => store.mark_sent(alert.id).await?,
     }

@@ -10,20 +10,8 @@ use crate::keywords::{
     NamedDay,
 };
 use crate::{
-    local_to_utc, ParseContext, ParseError, Parsed, RecurrencePattern, DEFAULT_TIME,
-    MIN_INTERVAL_SECONDS,
+    local_to_utc, ParseContext, ParseError, Parsed, Schedule, DEFAULT_TIME, MIN_INTERVAL_SECONDS,
 };
-use botcore::Recurrence;
-
-const ALL_WEEKDAYS: [Weekday; 7] = [
-    Weekday::Mon,
-    Weekday::Tue,
-    Weekday::Wed,
-    Weekday::Thu,
-    Weekday::Fri,
-    Weekday::Sat,
-    Weekday::Sun,
-];
 
 /// (text, byte-offset where the token starts in the original input).
 type Token<'a> = (&'a str, usize);
@@ -110,10 +98,9 @@ fn parse_one_shot(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError>
     }
 
     Ok(Parsed {
-        fire_at,
+        schedule: Schedule::one_shot(fire_at, ctx.tz),
         text,
         had_explicit_time,
-        recurrence: None,
     })
 }
 
@@ -310,38 +297,30 @@ fn parse_recurring(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError
         return Err(ParseError::Empty);
     }
 
-    // 1. REL (`5m`, `30d`, `1d`, `1w`) — must validate min-interval, hence Result.
-    let rec = if let Some((p, end)) = try_recurring_relative(&tokens)? {
-        Some((p, end))
+    // Try each strategy. Relative needs Result because it validates min-interval.
+    let rec = if let Some(r) = try_recurring_relative(&tokens, ctx)? {
+        Some(r)
     } else {
-        try_recurring_weekday(&tokens)
-            .or_else(|| try_recurring_day_of_month(&tokens))
-            .or_else(|| try_recurring_month_day(&tokens))
+        try_recurring_weekday(&tokens, ctx)?
+            .or(try_recurring_day_of_month(&tokens, ctx)?)
+            .or(try_recurring_month_day(&tokens, ctx)?)
     };
 
-    let (pattern, end_offset) = rec.ok_or(ParseError::NoTimeExpression)?;
+    let (schedule, end_offset) = rec.ok_or(ParseError::NoTimeExpression)?;
 
     let text = input[end_offset..].trim().to_string();
     if text.is_empty() {
         return Err(ParseError::MissingText);
     }
 
-    let fire_at = pattern
-        .next_after(ctx.now_utc, ctx.tz)
-        .ok_or(ParseError::NoTimeExpression)?;
-
-    Ok(Parsed {
-        fire_at,
-        text,
-        had_explicit_time: false,
-        recurrence: Some(pattern),
-    })
+    Ok(Parsed { schedule, text, had_explicit_time: false })
 }
 
-/// Recurring REL → Interval (sub-day) or Weekly all-days (`*1d` daily).
+/// Recurring REL → Interval (sub-day) or Daily (`*1d` etc.).
 fn try_recurring_relative(
     tokens: &[Token<'_>],
-) -> Result<Option<(RecurrencePattern, usize)>, ParseError> {
+    ctx: &ParseContext,
+) -> Result<Option<(Schedule, usize)>, ParseError> {
     let Some((seconds, end_offset, _)) = parse_relative(tokens, false) else {
         return Ok(None);
     };
@@ -350,31 +329,38 @@ fn try_recurring_relative(
         return Err(ParseError::IntervalTooShort(MIN_INTERVAL_SECONDS));
     }
 
-    let pattern = if seconds == 86_400 {
-        // Daily — DST-safe Weekly all-days at default time.
-        RecurrencePattern::Weekly {
-            days: ALL_WEEKDAYS.to_vec(),
-            time: DEFAULT_TIME,
-        }
+    // Multi-of-day in seconds → Daily with default time (DST-safe).
+    // Otherwise → raw Interval starting at now+interval.
+    let schedule = if seconds % 86_400 == 0 && seconds > 0 {
+        let every_n_days = (seconds / 86_400) as u16;
+        let dtstart = next_dtstart_for_daily(every_n_days, DEFAULT_TIME, ctx);
+        Schedule::daily_at(dtstart, ctx.tz, every_n_days, DEFAULT_TIME)?
     } else {
-        RecurrencePattern::Interval { seconds }
+        let dtstart = ctx.now_utc + Duration::seconds(seconds);
+        Schedule::interval_seconds(dtstart, ctx.tz, seconds)?
     };
-    Ok(Some((pattern, end_offset)))
+    Ok(Some((schedule, end_offset)))
 }
 
-/// `*do 14:00`, `*mo,mi,fr 9`, `*montag` → Weekly { days, time }.
-fn try_recurring_weekday(tokens: &[Token<'_>]) -> Option<(RecurrencePattern, usize)> {
-    let first = *tokens.first()?;
-    let days = match_weekday_list(first.0)?;
-    if days.is_empty() {
-        return None;
-    }
+/// `*do 14:00`, `*mo,mi,fr 9`, `*montag` → weekly Schedule.
+fn try_recurring_weekday(
+    tokens: &[Token<'_>],
+    ctx: &ParseContext,
+) -> Result<Option<(Schedule, usize)>, ParseError> {
+    let Some(first) = tokens.first().copied() else {
+        return Ok(None);
+    };
+    let Some(days) = match_weekday_list(first.0) else {
+        return Ok(None);
+    };
 
     let (maybe_time, end_offset) =
         consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
     let time = maybe_time.unwrap_or(DEFAULT_TIME);
 
-    Some((RecurrencePattern::Weekly { days, time }, end_offset))
+    let dtstart = next_dtstart_for_weekly(&days, time, ctx);
+    let schedule = Schedule::weekly(dtstart, ctx.tz, &days, time)?;
+    Ok(Some((schedule, end_offset)))
 }
 
 fn match_weekday_list(token: &str) -> Option<Vec<Weekday>> {
@@ -396,16 +382,25 @@ fn match_weekday_list(token: &str) -> Option<Vec<Weekday>> {
     }
 }
 
-/// `*1.` (just a day with trailing dot) → Monthly.
-fn try_recurring_day_of_month(tokens: &[Token<'_>]) -> Option<(RecurrencePattern, usize)> {
-    let first = *tokens.first()?;
-    let day = parse_day_of_month_token(first.0)?;
+/// `*1.` (just a day with trailing dot) → monthly Schedule.
+fn try_recurring_day_of_month(
+    tokens: &[Token<'_>],
+    ctx: &ParseContext,
+) -> Result<Option<(Schedule, usize)>, ParseError> {
+    let Some(first) = tokens.first().copied() else {
+        return Ok(None);
+    };
+    let Some(day) = parse_day_of_month_token(first.0) else {
+        return Ok(None);
+    };
 
     let (maybe_time, end_offset) =
         consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
     let time = maybe_time.unwrap_or(DEFAULT_TIME);
 
-    Some((RecurrencePattern::Monthly { day, time }, end_offset))
+    let dtstart = next_dtstart_for_monthly(day, time, ctx);
+    let schedule = Schedule::monthly(dtstart, ctx.tz, day, time)?;
+    Ok(Some((schedule, end_offset)))
 }
 
 fn parse_day_of_month_token(s: &str) -> Option<u8> {
@@ -423,16 +418,25 @@ fn parse_day_of_month_token(s: &str) -> Option<u8> {
     Some(day)
 }
 
-/// `*24.12` → Yearly Dec 24.
-fn try_recurring_month_day(tokens: &[Token<'_>]) -> Option<(RecurrencePattern, usize)> {
-    let first = *tokens.first()?;
-    let (day, month) = parse_month_day_token(first.0)?;
+/// `*24.12` → yearly Schedule on Dec 24.
+fn try_recurring_month_day(
+    tokens: &[Token<'_>],
+    ctx: &ParseContext,
+) -> Result<Option<(Schedule, usize)>, ParseError> {
+    let Some(first) = tokens.first().copied() else {
+        return Ok(None);
+    };
+    let Some((day, month)) = parse_month_day_token(first.0) else {
+        return Ok(None);
+    };
 
     let (maybe_time, end_offset) =
         consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
     let time = maybe_time.unwrap_or(DEFAULT_TIME);
 
-    Some((RecurrencePattern::Yearly { month, day, time }, end_offset))
+    let dtstart = next_dtstart_for_yearly(month, day, time, ctx);
+    let schedule = Schedule::yearly(dtstart, ctx.tz, month, day, time)?;
+    Ok(Some((schedule, end_offset)))
 }
 
 fn parse_month_day_token(s: &str) -> Option<(u8, u8)> {
@@ -450,6 +454,90 @@ fn parse_month_day_token(s: &str) -> Option<(u8, u8)> {
     }
     NaiveDate::from_ymd_opt(2024, month as u32, day as u32)?; // sanity check
     Some((day, month))
+}
+
+// ---------------------------------------------------------------------------
+// dtstart helpers — find the first future occurrence that matches the rule,
+// so the resulting Schedule's RRULE expansion starts at the right anchor.
+// ---------------------------------------------------------------------------
+
+fn next_dtstart_for_daily(every_n_days: u16, time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
+    let today = ctx.now_utc.with_timezone(&ctx.tz).date_naive();
+    let upper = every_n_days as i64 + 1;
+    for offset in 0..=upper {
+        let date = today + Duration::days(offset);
+        if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
+            if dt > ctx.now_utc {
+                return dt;
+            }
+        }
+    }
+    ctx.now_utc + Duration::days(every_n_days as i64)
+}
+
+fn next_dtstart_for_weekly(
+    days: &[Weekday],
+    time: NaiveTime,
+    ctx: &ParseContext,
+) -> DateTime<Utc> {
+    let today = ctx.now_utc.with_timezone(&ctx.tz).date_naive();
+    for offset in 0..=7 {
+        let date = today + Duration::days(offset);
+        if !days.contains(&date.weekday()) {
+            continue;
+        }
+        if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
+            if dt > ctx.now_utc {
+                return dt;
+            }
+        }
+    }
+    ctx.now_utc + Duration::days(7)
+}
+
+fn next_dtstart_for_monthly(day: u8, time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
+    use chrono::Datelike;
+    let local_now = ctx.now_utc.with_timezone(&ctx.tz);
+    let mut year = local_now.year();
+    let mut month = local_now.month();
+    for _ in 0..14 {
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day as u32) {
+            if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
+                if dt > ctx.now_utc {
+                    return dt;
+                }
+            }
+        }
+        if month == 12 {
+            year += 1;
+            month = 1;
+        } else {
+            month += 1;
+        }
+    }
+    ctx.now_utc + Duration::days(31)
+}
+
+fn next_dtstart_for_yearly(
+    month: u8,
+    day: u8,
+    time: NaiveTime,
+    ctx: &ParseContext,
+) -> DateTime<Utc> {
+    use chrono::Datelike;
+    let local_now = ctx.now_utc.with_timezone(&ctx.tz);
+    let mut year = local_now.year();
+    for _ in 0..5 {
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month as u32, day as u32) {
+            if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
+                if dt > ctx.now_utc {
+                    return dt;
+                }
+            }
+        }
+        year += 1;
+    }
+    ctx.now_utc + Duration::days(365)
 }
 
 // ---------------------------------------------------------------------------

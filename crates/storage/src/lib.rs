@@ -13,7 +13,8 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 
 use botcore::{
-    Alert, AlertScope, AlertState, ChatType, Language, NewAlert, RecurrencePattern, User,
+    schedule_from_legacy, Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule,
+    User,
 };
 
 #[derive(Debug, Error)]
@@ -121,9 +122,13 @@ impl PgStore {
     pub async fn create_alert(&self, new: NewAlert) -> Result<Alert> {
         let row = sqlx::query(
             r#"
-            INSERT INTO alerts (user_id, chat_id, chat_type, scope, text, fire_at, recurrence)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+            INSERT INTO alerts (
+                user_id, chat_id, chat_type, scope, text, fire_at,
+                dtstart, rrule, tz
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
+                      recurrence, dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             "#,
         )
@@ -133,7 +138,9 @@ impl PgStore {
         .bind(new.scope.as_str())
         .bind(&new.text)
         .bind(new.fire_at)
-        .bind(new.recurrence.as_ref().map(|r| r.serialize()))
+        .bind(new.schedule.dtstart)
+        .bind(new.schedule.rrule.as_deref())
+        .bind(new.schedule.tz.name())
         .fetch_one(&self.pool)
         .await?;
 
@@ -143,7 +150,8 @@ impl PgStore {
     pub async fn get_alert(&self, id: i64) -> Result<Option<Alert>> {
         let row = sqlx::query(
             r#"
-            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
+                   recurrence, dtstart, rrule, tz,
                    state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             FROM alerts WHERE id = $1
             "#,
@@ -160,7 +168,8 @@ impl PgStore {
     pub async fn list_active_for_chat(&self, chat_id: i64) -> Result<Vec<Alert>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
+                   recurrence, dtstart, rrule, tz,
                    state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             FROM alerts
             WHERE chat_id = $1 AND state IN ('pending', 'claimed')
@@ -216,7 +225,8 @@ impl PgStore {
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at, recurrence,
+            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
+                      recurrence, dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             "#,
         )
@@ -342,18 +352,32 @@ fn row_to_alert(row: PgRow) -> Result<Alert> {
     let chat_type_str: String = row.try_get("chat_type")?;
     let scope_str: String = row.try_get("scope")?;
     let state_str: String = row.try_get("state")?;
-    let recurrence_str: Option<String> = row.try_get("recurrence")?;
 
     let chat_type =
         ChatType::parse(&chat_type_str).ok_or_else(|| StorageError::InvalidEnum(chat_type_str))?;
     let scope = AlertScope::parse(&scope_str).ok_or_else(|| StorageError::InvalidEnum(scope_str))?;
     let state = AlertState::parse(&state_str).ok_or_else(|| StorageError::InvalidEnum(state_str))?;
-    let recurrence = match recurrence_str {
-        Some(s) => Some(
-            RecurrencePattern::deserialize(&s)
-                .map_err(|e| StorageError::InvalidEnum(e.to_string()))?,
-        ),
-        None => None,
+
+    let dtstart: DateTime<Utc> = row.try_get("dtstart")?;
+    let tz_name: String = row.try_get("tz")?;
+    let tz: Tz = tz_name
+        .parse()
+        .map_err(|_| StorageError::InvalidTimezone(tz_name.clone()))?;
+    let rrule_str: Option<String> = row.try_get("rrule")?;
+    let legacy_recurrence: Option<String> = row.try_get("recurrence")?;
+
+    // Schedule construction:
+    //   1. Prefer the new `rrule` column if present.
+    //   2. Otherwise fall back to the legacy `recurrence` column and translate
+    //      on read; the next write will replace it with the new form.
+    //   3. If both are absent, it's a one-shot.
+    let schedule = match (rrule_str.as_deref(), legacy_recurrence.as_deref()) {
+        (Some(s), _) => Schedule::from_db(dtstart, tz, Some(s))
+            .map_err(|e| StorageError::InvalidEnum(e.to_string()))?,
+        (None, Some(legacy)) => schedule_from_legacy(legacy, dtstart, tz)
+            .map_err(|e| StorageError::InvalidEnum(e.to_string()))?
+            .unwrap_or_else(|| Schedule::one_shot(dtstart, tz)),
+        (None, None) => Schedule::one_shot(dtstart, tz),
     };
 
     Ok(Alert {
@@ -364,7 +388,7 @@ fn row_to_alert(row: PgRow) -> Result<Alert> {
         scope,
         text: row.try_get("text")?,
         fire_at: row.try_get("fire_at")?,
-        recurrence,
+        schedule,
         state,
         attempts: row.try_get("attempts")?,
         last_error: row.try_get("last_error")?,
