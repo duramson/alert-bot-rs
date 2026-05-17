@@ -5,6 +5,7 @@
 //! beat the indirection of an FTL file plus runtime lookups.
 
 use botcore::Language;
+use parser::ParseNote;
 
 /// Localized command-menu entries shown in the Telegram client's `/`-picker.
 /// Returned in the order they should appear.
@@ -206,6 +207,35 @@ pub fn parse_error_invalid_rel_spec(lang: Language) -> &'static str {
     match lang {
         Language::De => "Die relative Angabe sieht falsch aus — Reihenfolge ist Y>M>w>d>h>m>s, ohne Leerzeichen. Beispiel: 1Y2M15d8h30m.",
         Language::En => "That relative spec looks off — the order is Y>M>w>d>h>m>s with no spaces. Example: 1Y2M15d8h30m.",
+    }
+}
+
+pub fn parse_note(note: ParseNote, lang: Language) -> String {
+    match (note, lang) {
+        (ParseNote::LeapClampedToFeb28 { new_year }, Language::De) => {
+            format!("Hinweis: 29.2. → 28.2. in {new_year} (kein Schaltjahr).")
+        }
+        (ParseNote::LeapClampedToFeb28 { new_year }, Language::En) => {
+            format!("Note: Feb 29 → Feb 28 in {new_year} (not a leap year).")
+        }
+        (ParseNote::MonthDayClamped { before_day, after_day }, Language::De) => format!(
+            "Hinweis: Tag {before_day} gibt es im Zielmonat nicht — angepasst auf {after_day}."
+        ),
+        (ParseNote::MonthDayClamped { before_day, after_day }, Language::En) => format!(
+            "Note: day {before_day} doesn't exist in the target month — clamped to {after_day}."
+        ),
+        (ParseNote::MonthlyLastDay, Language::De) => {
+            "Hinweis: in Monaten ohne 31. feuert der Reminder am letzten Tag des Monats.".into()
+        }
+        (ParseNote::MonthlyLastDay, Language::En) => {
+            "Note: in months without a 31st, this fires on the last day of the month.".into()
+        }
+        (ParseNote::YearlyFeb29Fallback, Language::De) => {
+            "Hinweis: in Nicht-Schaltjahren feuert dieser Reminder am 28.2..".into()
+        }
+        (ParseNote::YearlyFeb29Fallback, Language::En) => {
+            "Note: in non-leap years this fires on Feb 28.".into()
+        }
     }
 }
 

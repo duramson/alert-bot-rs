@@ -13,7 +13,7 @@ use crate::keywords::{
     match_named_day, NamedDay, TimeUnit,
 };
 use crate::{
-    local_to_utc, Language, ParseContext, ParseError, Parsed, Schedule, DEFAULT_TIME,
+    local_to_utc, ParseContext, ParseError, ParseNote, Parsed, Schedule, DEFAULT_TIME,
     MAX_RELATIVE_YEARS, MIN_INTERVAL_SECONDS,
 };
 
@@ -114,16 +114,12 @@ fn parse_one_shot(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError>
 fn try_one_shot_strategies(
     tokens: &[Token<'_>],
     ctx: &ParseContext,
-) -> Result<(DateTime<Utc>, usize, Vec<String>), ParseError> {
+) -> Result<(DateTime<Utc>, usize, Vec<ParseNote>), ParseError> {
     // 1. Relative (compact, inline-longform, or two-token longform).
     if let Some((spec, end_idx, default_end)) = try_relative_match(tokens)? {
         let (override_time, end_offset) =
             consume_optional_time(tokens, end_idx).unwrap_or((None, default_end));
-        let (fire_at, notes) = spec.apply(ctx.now_utc, ctx.tz, override_time, ctx.language)?;
-        let cap = Duration::days(MAX_RELATIVE_YEARS as i64 * 366);
-        if fire_at - ctx.now_utc > cap {
-            return Err(ParseError::RelTooFar(MAX_RELATIVE_YEARS));
-        }
+        let (fire_at, notes) = spec.apply(ctx.now_utc, ctx.tz, override_time)?;
         return Ok((fire_at, end_offset, notes));
     }
 
@@ -274,8 +270,7 @@ impl RelSpec {
         base_utc: DateTime<Utc>,
         tz: chrono_tz::Tz,
         override_time: Option<NaiveTime>,
-        lang: Language,
-    ) -> Result<(DateTime<Utc>, Vec<String>), ParseError> {
+    ) -> Result<(DateTime<Utc>, Vec<ParseNote>), ParseError> {
         let mut notes = Vec::new();
         if self.is_zero() {
             return Err(ParseError::NoTimeExpression);
@@ -283,13 +278,22 @@ impl RelSpec {
         if override_time.is_some() && self.has_sub_day() {
             return Err(ParseError::SubDayRelWithOverride);
         }
+        // Pre-check the obvious case (`100Y`) before doing any calendar math.
+        // A post-check below still catches weird combos like `100000d`.
+        if self.years as i32 > MAX_RELATIVE_YEARS {
+            return Err(ParseError::RelTooFar(MAX_RELATIVE_YEARS));
+        }
 
         if override_time.is_none() && self.years == 0 && self.months == 0 {
             let secs = (self.weeks as i64 * 7 + self.days as i64) * 86_400
                 + self.hours as i64 * 3600
                 + self.minutes as i64 * 60
                 + self.seconds as i64;
-            return Ok((base_utc + Duration::seconds(secs), notes));
+            let result = base_utc + Duration::seconds(secs);
+            if result - base_utc > Duration::days(MAX_RELATIVE_YEARS as i64 * 366) {
+                return Err(ParseError::RelTooFar(MAX_RELATIVE_YEARS));
+            }
+            return Ok((result, notes));
         }
 
         let local_base = base_utc.with_timezone(&tz);
@@ -304,8 +308,7 @@ impl RelSpec {
             target_date = match target_date.with_year(new_year) {
                 Some(d) => d,
                 None => {
-                    // Feb 29 in non-leap target year — fall back to Feb 28.
-                    notes.push(note_leap_clamp(lang, target_date, new_year));
+                    notes.push(ParseNote::LeapClampedToFeb28 { new_year });
                     NaiveDate::from_ymd_opt(new_year, target_date.month(), 28).ok_or_else(|| {
                         ParseError::InvalidDate(format!(
                             "Y add fallback failed for {target_date} -> {new_year}"
@@ -322,7 +325,10 @@ impl RelSpec {
                     ParseError::InvalidDate(format!("M add: {target_date} + {}M", self.months))
                 })?;
             if before.day() > target_date.day() {
-                notes.push(note_month_clamp(lang, before.day(), target_date.day()));
+                notes.push(ParseNote::MonthDayClamped {
+                    before_day: before.day(),
+                    after_day: target_date.day(),
+                });
             }
         }
         if self.weeks > 0 {
@@ -340,6 +346,10 @@ impl RelSpec {
                 + self.minutes as i64 * 60
                 + self.seconds as i64;
             result += Duration::seconds(secs);
+        }
+        // Post-check: catches huge non-Y specs like `100000d` (~274 years).
+        if result - base_utc > Duration::days(MAX_RELATIVE_YEARS as i64 * 366) {
+            return Err(ParseError::RelTooFar(MAX_RELATIVE_YEARS));
         }
         Ok((result, notes))
     }
@@ -428,28 +438,6 @@ fn split_leading_digits(s: &str) -> Option<(i64, &str)> {
     }
     let num: i64 = s[..split].parse().ok()?;
     Some((num, &s[split..]))
-}
-
-fn note_leap_clamp(lang: Language, from: NaiveDate, new_year: i32) -> String {
-    match lang {
-        Language::De => format!(
-            "29.2. → 28.2. in {new_year} (kein Schaltjahr)",
-            new_year = new_year
-        ),
-        Language::En => format!("Feb 29 → Feb 28 in {new_year} (not a leap year)"),
-    }
-    .replace("{from}", &from.to_string())
-}
-
-fn note_month_clamp(lang: Language, before_day: u32, after_day: u32) -> String {
-    match lang {
-        Language::De => format!(
-            "Tag {before_day} gibt es im Zielmonat nicht — angepasst auf {after_day}"
-        ),
-        Language::En => format!(
-            "day {before_day} doesn't exist in the target month — clamped to {after_day}"
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,15 +549,20 @@ fn consume_optional_time(
 }
 
 /// Accepts `14:30`, `14`, `2pm`, `2:30pm`, `12am`, `12pm`. Case-insensitive
-/// for the am/pm suffix.
+/// for the am/pm suffix — but we avoid the `to_lowercase()` allocation by
+/// matching on ASCII bytes directly, since the digit-only path is by far the
+/// hottest one on the parse fast path.
 fn parse_clock(s: &str) -> Option<NaiveTime> {
-    let lower = s.to_lowercase();
-    let (body, ampm): (&str, Option<bool>) = if let Some(rest) = lower.strip_suffix("am") {
-        (rest, Some(false))
-    } else if let Some(rest) = lower.strip_suffix("pm") {
-        (rest, Some(true))
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let (body, ampm): (&str, Option<bool>) = if n >= 2
+        && matches!(bytes[n - 1], b'm' | b'M')
+        && matches!(bytes[n - 2], b'a' | b'A' | b'p' | b'P')
+    {
+        let pm = matches!(bytes[n - 2], b'p' | b'P');
+        (&s[..n - 2], Some(pm))
     } else {
-        (lower.as_str(), None)
+        (s, None)
     };
     if body.is_empty() {
         return None;
@@ -583,12 +576,16 @@ fn parse_clock(s: &str) -> Option<NaiveTime> {
         (body.parse().ok()?, 0)
     };
     let h = match ampm {
-        Some(false) /* AM */ => {
-            if h == 12 { 0 } else if h <= 11 { h } else { return None }
-        }
-        Some(true) /* PM */ => {
-            if h == 12 { 12 } else if h <= 11 { h + 12 } else { return None }
-        }
+        Some(false) /* AM */ => match h {
+            12 => 0,
+            0..=11 => h,
+            _ => return None,
+        },
+        Some(true) /* PM */ => match h {
+            12 => 12,
+            0..=11 => h + 12,
+            _ => return None,
+        },
         None => h,
     };
     if h > 23 || m > 59 {
@@ -660,27 +657,12 @@ fn parse_recurring(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError
         return Err(ParseError::Empty);
     }
 
-    let mut notes = Vec::new();
+    let matched = try_recurring_relative(&tokens, ctx)?
+        .or_else_result(|| try_recurring_weekday(&tokens, ctx))?
+        .or_else_result(|| try_recurring_day_of_month(&tokens, ctx))?
+        .or_else_result(|| try_recurring_month_day(&tokens, ctx))?;
 
-    let (schedule, end_offset) = if let Some((sch, end)) =
-        try_recurring_relative(&tokens, ctx)?
-    {
-        (sch, end)
-    } else if let Some((sch, end)) = try_recurring_weekday(&tokens, ctx)? {
-        (sch, end)
-    } else if let Some((sch, end, note)) = try_recurring_day_of_month(&tokens, ctx)? {
-        if let Some(n) = note {
-            notes.push(n);
-        }
-        (sch, end)
-    } else if let Some((sch, end, note)) = try_recurring_month_day(&tokens, ctx)? {
-        if let Some(n) = note {
-            notes.push(n);
-        }
-        (sch, end)
-    } else {
-        return Err(ParseError::NoTimeExpression);
-    };
+    let (schedule, end_offset, note) = matched.ok_or(ParseError::NoTimeExpression)?;
 
     let text = input[end_offset..].trim().to_string();
     if text.is_empty() {
@@ -690,14 +672,33 @@ fn parse_recurring(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError
     Ok(Parsed {
         schedule,
         text,
-        notes,
+        notes: note.into_iter().collect(),
     })
 }
+
+/// Helper to chain fallible `Option`-returning strategies without nested `if let` chains.
+trait OptionOrElseResult<T, E> {
+    fn or_else_result(self, f: impl FnOnce() -> Result<Option<T>, E>) -> Result<Option<T>, E>;
+}
+
+impl<T, E> OptionOrElseResult<T, E> for Option<T> {
+    fn or_else_result(self, f: impl FnOnce() -> Result<Option<T>, E>) -> Result<Option<T>, E> {
+        match self {
+            Some(v) => Ok(Some(v)),
+            None => f(),
+        }
+    }
+}
+
+/// Uniform return type for the four recurring strategies. The optional note
+/// carries an edge-case flag (e.g. `*31.` → `MonthlyLastDay`) so the dispatcher
+/// can hoist it into `Parsed.notes` without each strategy duplicating the push.
+type RecurringMatch = (Schedule, usize, Option<ParseNote>);
 
 fn try_recurring_relative(
     tokens: &[Token<'_>],
     ctx: &ParseContext,
-) -> Result<Option<(Schedule, usize)>, ParseError> {
+) -> Result<Option<RecurringMatch>, ParseError> {
     // Recurring REL doesn't accept the `in` prefix (`*in 5m` is unidiomatic),
     // so reject upfront if it's there.
     if tokens.first().is_some_and(|t| is_in_prefix(t.0)) {
@@ -728,13 +729,13 @@ fn try_recurring_relative(
         let dtstart = ctx.now_utc + Duration::seconds(total_secs);
         Schedule::interval_seconds(dtstart, ctx.tz, total_secs)?
     };
-    Ok(Some((schedule, end_offset)))
+    Ok(Some((schedule, end_offset, None)))
 }
 
 fn try_recurring_weekday(
     tokens: &[Token<'_>],
     ctx: &ParseContext,
-) -> Result<Option<(Schedule, usize)>, ParseError> {
+) -> Result<Option<RecurringMatch>, ParseError> {
     let Some(first) = tokens.first().copied() else {
         return Ok(None);
     };
@@ -748,7 +749,7 @@ fn try_recurring_weekday(
 
     let dtstart = next_dtstart_for_weekly(&days, time, ctx);
     let schedule = Schedule::weekly(dtstart, ctx.tz, &days, time)?;
-    Ok(Some((schedule, end_offset)))
+    Ok(Some((schedule, end_offset, None)))
 }
 
 fn match_weekday_list(token: &str) -> Option<Vec<Weekday>> {
@@ -773,7 +774,7 @@ fn match_weekday_list(token: &str) -> Option<Vec<Weekday>> {
 fn try_recurring_day_of_month(
     tokens: &[Token<'_>],
     ctx: &ParseContext,
-) -> Result<Option<(Schedule, usize, Option<String>)>, ParseError> {
+) -> Result<Option<RecurringMatch>, ParseError> {
     let Some(first) = tokens.first().copied() else {
         return Ok(None);
     };
@@ -788,7 +789,7 @@ fn try_recurring_day_of_month(
     let (schedule, note) = if day == 31 {
         let dtstart = next_dtstart_for_monthly_last_day(time, ctx);
         let sch = Schedule::monthly_last_day(dtstart, ctx.tz, time)?;
-        (sch, Some(note_last_day_of_month(ctx.language)))
+        (sch, Some(ParseNote::MonthlyLastDay))
     } else {
         let dtstart = next_dtstart_for_monthly(day, time, ctx);
         let sch = Schedule::monthly(dtstart, ctx.tz, day, time)?;
@@ -815,7 +816,7 @@ fn parse_day_of_month_token(s: &str) -> Option<u8> {
 fn try_recurring_month_day(
     tokens: &[Token<'_>],
     ctx: &ParseContext,
-) -> Result<Option<(Schedule, usize, Option<String>)>, ParseError> {
+) -> Result<Option<RecurringMatch>, ParseError> {
     let Some(first) = tokens.first().copied() else {
         return Ok(None);
     };
@@ -830,7 +831,7 @@ fn try_recurring_month_day(
     let (schedule, note) = if day == 29 && month == 2 {
         let dtstart = next_dtstart_for_yearly_last_day_of_month(month, time, ctx);
         let sch = Schedule::yearly_last_day_of_month(dtstart, ctx.tz, month, time)?;
-        (sch, Some(note_leap_day_yearly(ctx.language)))
+        (sch, Some(ParseNote::YearlyFeb29Fallback))
     } else {
         let dtstart = next_dtstart_for_yearly(month, day, time, ctx);
         let sch = Schedule::yearly(dtstart, ctx.tz, month, day, time)?;
@@ -864,22 +865,58 @@ fn parse_month_day_token(s: &str) -> Option<(u8, u8)> {
 // dtstart helpers — find the first future occurrence matching the rule.
 // ---------------------------------------------------------------------------
 
-fn next_dtstart_for_daily(
-    every_n_days: u16,
+/// Find the first candidate date (in user-local tz) that maps to a UTC
+/// instant strictly after `ctx.now_utc`. Iterators that produce dates which
+/// aren't valid (`NaiveDate::from_ymd_opt` already filtered) just don't yield;
+/// dates that fall into a DST gap silently advance.
+fn first_future_dtstart(
+    candidates: impl IntoIterator<Item = NaiveDate>,
     time: NaiveTime,
     ctx: &ParseContext,
+    fallback: DateTime<Utc>,
 ) -> DateTime<Utc> {
-    let today = ctx.now_utc.with_timezone(&ctx.tz).date_naive();
-    let upper = every_n_days as i64 + 1;
-    for offset in 0..=upper {
-        let date = today + Duration::days(offset);
+    for date in candidates {
         if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
             if dt > ctx.now_utc {
                 return dt;
             }
         }
     }
-    ctx.now_utc + Duration::days(every_n_days as i64)
+    fallback
+}
+
+/// Iterator over `(year, month)` pairs starting at `(start_y, start_m)`,
+/// advancing one month at a time for `count` steps.
+fn month_iter(start_y: i32, start_m: u32, count: u32) -> impl Iterator<Item = (i32, u32)> {
+    (0..count).scan((start_y, start_m), |(y, m), _| {
+        let cur = (*y, *m);
+        if *m == 12 {
+            *y += 1;
+            *m = 1;
+        } else {
+            *m += 1;
+        }
+        Some(cur)
+    })
+}
+
+fn today_local(ctx: &ParseContext) -> NaiveDate {
+    ctx.now_utc.with_timezone(&ctx.tz).date_naive()
+}
+
+fn next_dtstart_for_daily(
+    every_n_days: u16,
+    time: NaiveTime,
+    ctx: &ParseContext,
+) -> DateTime<Utc> {
+    let today = today_local(ctx);
+    let candidates = (0..=every_n_days as i64 + 1).map(|n| today + Duration::days(n));
+    first_future_dtstart(
+        candidates,
+        time,
+        ctx,
+        ctx.now_utc + Duration::days(every_n_days as i64),
+    )
 }
 
 fn next_dtstart_for_weekly(
@@ -887,67 +924,26 @@ fn next_dtstart_for_weekly(
     time: NaiveTime,
     ctx: &ParseContext,
 ) -> DateTime<Utc> {
-    let today = ctx.now_utc.with_timezone(&ctx.tz).date_naive();
-    for offset in 0..=7 {
-        let date = today + Duration::days(offset);
-        if !days.contains(&date.weekday()) {
-            continue;
-        }
-        if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
-            if dt > ctx.now_utc {
-                return dt;
-            }
-        }
-    }
-    ctx.now_utc + Duration::days(7)
+    let today = today_local(ctx);
+    let candidates = (0..=7).filter_map(|n: i64| {
+        let d = today + Duration::days(n);
+        days.contains(&d.weekday()).then_some(d)
+    });
+    first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(7))
 }
 
 fn next_dtstart_for_monthly(day: u8, time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
     let local_now = ctx.now_utc.with_timezone(&ctx.tz);
-    let mut year = local_now.year();
-    let mut month = local_now.month();
-    for _ in 0..14 {
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day as u32) {
-            if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
-                if dt > ctx.now_utc {
-                    return dt;
-                }
-            }
-        }
-        if month == 12 {
-            year += 1;
-            month = 1;
-        } else {
-            month += 1;
-        }
-    }
-    ctx.now_utc + Duration::days(31)
+    let candidates = month_iter(local_now.year(), local_now.month(), 14)
+        .filter_map(|(y, m)| NaiveDate::from_ymd_opt(y, m, day as u32));
+    first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(31))
 }
 
-fn next_dtstart_for_monthly_last_day(
-    time: NaiveTime,
-    ctx: &ParseContext,
-) -> DateTime<Utc> {
+fn next_dtstart_for_monthly_last_day(time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
     let local_now = ctx.now_utc.with_timezone(&ctx.tz);
-    let mut year = local_now.year();
-    let mut month = local_now.month();
-    for _ in 0..14 {
-        let last_day = last_day_of_month(year, month);
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month, last_day) {
-            if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
-                if dt > ctx.now_utc {
-                    return dt;
-                }
-            }
-        }
-        if month == 12 {
-            year += 1;
-            month = 1;
-        } else {
-            month += 1;
-        }
-    }
-    ctx.now_utc + Duration::days(31)
+    let candidates = month_iter(local_now.year(), local_now.month(), 14)
+        .filter_map(|(y, m)| NaiveDate::from_ymd_opt(y, m, last_day_of_month(y, m)));
+    first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(31))
 }
 
 fn next_dtstart_for_yearly(
@@ -956,19 +952,10 @@ fn next_dtstart_for_yearly(
     time: NaiveTime,
     ctx: &ParseContext,
 ) -> DateTime<Utc> {
-    let local_now = ctx.now_utc.with_timezone(&ctx.tz);
-    let mut year = local_now.year();
-    for _ in 0..5 {
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month as u32, day as u32) {
-            if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
-                if dt > ctx.now_utc {
-                    return dt;
-                }
-            }
-        }
-        year += 1;
-    }
-    ctx.now_utc + Duration::days(365)
+    let base_year = ctx.now_utc.with_timezone(&ctx.tz).year();
+    let candidates =
+        (0..5).filter_map(|n| NaiveDate::from_ymd_opt(base_year + n, month as u32, day as u32));
+    first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(365))
 }
 
 fn next_dtstart_for_yearly_last_day_of_month(
@@ -976,20 +963,12 @@ fn next_dtstart_for_yearly_last_day_of_month(
     time: NaiveTime,
     ctx: &ParseContext,
 ) -> DateTime<Utc> {
-    let local_now = ctx.now_utc.with_timezone(&ctx.tz);
-    let mut year = local_now.year();
-    for _ in 0..5 {
-        let last = last_day_of_month(year, month as u32);
-        if let Some(date) = NaiveDate::from_ymd_opt(year, month as u32, last) {
-            if let Ok(dt) = local_to_utc(date, time, ctx.tz) {
-                if dt > ctx.now_utc {
-                    return dt;
-                }
-            }
-        }
-        year += 1;
-    }
-    ctx.now_utc + Duration::days(365)
+    let base_year = ctx.now_utc.with_timezone(&ctx.tz).year();
+    let candidates = (0..5).filter_map(|n| {
+        let y = base_year + n;
+        NaiveDate::from_ymd_opt(y, month as u32, last_day_of_month(y, month as u32))
+    });
+    first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(365))
 }
 
 fn last_day_of_month(year: i32, month: u32) -> u32 {
@@ -1003,16 +982,3 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
     28
 }
 
-fn note_last_day_of_month(lang: Language) -> String {
-    match lang {
-        Language::De => "Hinweis: in Monaten ohne 31. feuert der Reminder am letzten Tag des Monats.".to_string(),
-        Language::En => "Note: in months without a 31st, this fires on the last day of the month.".to_string(),
-    }
-}
-
-fn note_leap_day_yearly(lang: Language) -> String {
-    match lang {
-        Language::De => "Hinweis: in Nicht-Schaltjahren feuert dieser Reminder am 28.2..".to_string(),
-        Language::En => "Note: in non-leap years this fires on Feb 28.".to_string(),
-    }
-}

@@ -48,10 +48,25 @@ pub struct Parsed {
     pub schedule: Schedule,
     /// Reminder text — everything after the time expression, trimmed.
     pub text: String,
-    /// Pre-localized notes the user should see *once* at creation time —
-    /// e.g. „`*31.` feuert in kurzen Monaten am letzten Tag". Empty when there
-    /// is nothing to flag.
-    pub notes: Vec<String>,
+    /// Edge-case notes the user should see *once* at creation time. Typed so
+    /// the bot crate owns the user-facing strings.
+    pub notes: Vec<ParseNote>,
+}
+
+/// Edge-case flags emitted at parse time. Localized in `bot::messages`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ParseNote {
+    /// `1Y` added to a Feb-29 date landed in a non-leap target year, so we
+    /// clamped to Feb 28.
+    LeapClampedToFeb28 { new_year: i32 },
+    /// `NM` added past the end of the target month, so the day got clamped
+    /// down (e.g. Jan 31 + 1M → Feb 28/29).
+    MonthDayClamped { before_day: u32, after_day: u32 },
+    /// `*31.` — in months shorter than 31 days, the alert fires on the last
+    /// day of the month.
+    MonthlyLastDay,
+    /// `*29.2` — in non-leap years, the alert fires on Feb 28.
+    YearlyFeb29Fallback,
 }
 
 impl Parsed {

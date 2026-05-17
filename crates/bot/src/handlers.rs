@@ -146,7 +146,7 @@ async fn create_alert(
 
     for note in &parsed.notes {
         reply.push('\n');
-        reply.push_str(&html_escape(note));
+        reply.push_str(&html_escape(&m::parse_note(*note, user.language)));
     }
 
     bot.send_message(msg.chat.id, reply)
