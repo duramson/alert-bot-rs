@@ -181,6 +181,34 @@ pub fn parse_error_missing_text(lang: Language) -> &'static str {
     }
 }
 
+pub fn parse_error_heute_rejected(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "„heute“ verstehe ich nicht — schreib direkt die Uhrzeit, z.B. /alert 22:00 Bier.",
+        Language::En => "I don’t take „today“ — just use the time directly, e.g. /alert 22:00 beer.",
+    }
+}
+
+pub fn parse_error_subday_override(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Uhrzeit-Override geht nur, wenn die relative Angabe keine Stunden/Minuten/Sekunden hat. Beispiele: /alert 2d 11:00 text, /alert 1Y 9:00 text.",
+        Language::En => "Clock-time override only works when the relative spec has no sub-day components. Examples: /alert 2d 11:00 text, /alert 1Y 9:00 text.",
+    }
+}
+
+pub fn parse_error_rel_too_far(lang: Language, years: i32) -> String {
+    match lang {
+        Language::De => format!("Das ist mehr als {years} Jahre in der Zukunft — so weit gehen einmalige Reminder nicht."),
+        Language::En => format!("That's more than {years} years out — one-shot reminders are capped at {years}."),
+    }
+}
+
+pub fn parse_error_invalid_rel_spec(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Die relative Angabe sieht falsch aus — Reihenfolge ist Y>M>w>d>h>m>s, ohne Leerzeichen. Beispiel: 1Y2M15d8h30m.",
+        Language::En => "That relative spec looks off — the order is Y>M>w>d>h>m>s with no spaces. Example: 1Y2M15d8h30m.",
+    }
+}
+
 pub fn list_empty(lang: Language) -> &'static str {
     match lang {
         Language::De => "Keine aktiven Reminder.",

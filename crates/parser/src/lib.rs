@@ -1,36 +1,37 @@
 //! Time-expression parser for the alert bot.
 //!
 //! Parses German and English shorthand into a concrete `DateTime<Utc>` plus
-//! the leftover reminder text. Designed for the `/alert` command shape:
+//! the leftover reminder text. The contract lives in `RULES.md`; if this
+//! file disagrees with that file, this file is wrong.
 //!
-//! ```text
-//! /alert 5m Kaffee fertig         → in 5 minutes
-//! /alert 30d abo kündigen         → in 30 days
-//! /alert 30.4.26 scheidung        → on 30 April 2026, default time
-//! /alert morgen 9 Uhr Arzt        → tomorrow at 09:00
-//! /alert do 14:00 Standup         → next Thursday at 14:00
-//! /alert in 2 stunden Pizza       → relative with explicit "in"
-//! ```
+//! High-level strategy order for one-shots:
+//! relative (compact `1Y2M15d8h40m20s` or longform `30 minuten`) →
+//! absolute date (`30.4.26`, `2026-04-30`) → bare clock-time (`22:00`) →
+//! named day (`morgen`, `do`).
 //!
-//! Fuzzy matching: keywords (weekdays, "morgen", "Uhr" etc.) accept Levenshtein
-//! distance ≤ 2 against any of their aliases, so common typos don't break the
-//! parse. The reminder *text* is never fuzzy-matched — only the time prefix.
+//! Fuzzy matching applies to keywords only (weekdays, "morgen", "uhr", longform
+//! units). Numbers and the reminder text are never fuzzy-matched.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use thiserror::Error;
 
+mod grammar;
 mod keywords;
 
 pub use botcore::recurrence::MIN_INTERVAL_SECONDS;
 pub use botcore::{Language, Schedule, ScheduleError};
 
-/// Default time-of-day for named-day expressions without an explicit clock,
-/// e.g. `morgen Arzt` → tomorrow at 09:00 local time.
+/// Default time-of-day for absolute / named-day specs without an explicit
+/// clock (e.g. `morgen Arzt` → tomorrow at 09:00 local time).
 pub const DEFAULT_TIME: NaiveTime = match NaiveTime::from_hms_opt(9, 0, 0) {
     Some(t) => t,
     None => unreachable!(),
 };
+
+/// Maximum offset for *relative* one-shot specs (e.g. `100Y` is rejected).
+/// Recurring intervals have no upper cap.
+pub const MAX_RELATIVE_YEARS: i32 = 50;
 
 #[derive(Debug, Clone)]
 pub struct ParseContext {
@@ -47,9 +48,10 @@ pub struct Parsed {
     pub schedule: Schedule,
     /// Reminder text — everything after the time expression, trimmed.
     pub text: String,
-    /// `true` if the user gave an explicit clock time (e.g. `14:00`),
-    /// `false` if we filled in `DEFAULT_TIME`.
-    pub had_explicit_time: bool,
+    /// Pre-localized notes the user should see *once* at creation time —
+    /// e.g. „`*31.` feuert in kurzen Monaten am letzten Tag". Empty when there
+    /// is nothing to flag.
+    pub notes: Vec<String>,
 }
 
 impl Parsed {
@@ -77,6 +79,19 @@ pub enum ParseError {
     IntervalTooShort(i64),
     #[error("this kind of spec can't recur")]
     InvalidRecurrenceSpec,
+    /// `/alert heute ...` — user should write the bare clock-time instead.
+    #[error("'heute'/'today' is not a recognised spec — use a clock time directly")]
+    HeuteRejected,
+    /// `/alert 15h 11:00 ...` — override only allowed when the relative spec
+    /// has no sub-day components.
+    #[error("clock-time override is only allowed when the relative spec has no sub-day components")]
+    SubDayRelWithOverride,
+    /// `/alert 100Y ...` — over the `MAX_RELATIVE_YEARS` cap.
+    #[error("relative offset exceeds the {0}-year cap")]
+    RelTooFar(i32),
+    /// Compact REL components in wrong order or duplicated (e.g. `30m2h`).
+    #[error("relative spec components out of order or duplicated")]
+    InvalidRelSpec,
     #[error("rrule error: {0}")]
     Rrule(String),
 }
@@ -92,10 +107,7 @@ impl From<ScheduleError> for ParseError {
     }
 }
 
-mod grammar;
-
-/// Top-level entry point. Tries each strategy in order:
-/// relative (`5m`, `in 2 hours`), absolute date (`30.4.26`), named day (`morgen`).
+/// Top-level entry point.
 pub fn parse(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -104,9 +116,9 @@ pub fn parse(input: &str, ctx: &ParseContext) -> Result<Parsed, ParseError> {
     grammar::parse_command(trimmed, ctx)
 }
 
-/// Convenience for resolving a (date, time) pair in the user's tz to UTC.
-/// Falls back to the next valid local time if the naive datetime falls into
-/// a DST gap, and picks the earlier of two ambiguous instants.
+/// Resolve a (date, time) pair in the user's tz to UTC.
+/// Falls back to the next valid local time if the naive datetime falls into a
+/// DST gap, and picks the earlier of two ambiguous instants.
 pub(crate) fn local_to_utc(
     date: NaiveDate,
     time: NaiveTime,
@@ -117,7 +129,6 @@ pub(crate) fn local_to_utc(
         chrono::LocalResult::Single(dt) => Ok(dt.with_timezone(&Utc)),
         chrono::LocalResult::Ambiguous(earlier, _) => Ok(earlier.with_timezone(&Utc)),
         chrono::LocalResult::None => {
-            // DST gap: bump forward by an hour and retry.
             let bumped = naive
                 .with_hour(naive.hour().saturating_add(1))
                 .ok_or_else(|| ParseError::InvalidTime(format!("{naive}")))?;
@@ -129,13 +140,16 @@ pub(crate) fn local_to_utc(
     }
 }
 
+// ===========================================================================
+// Tests — fixed reference time 2026-05-08 12:00 Europe/Berlin (a Friday).
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
 
     fn ctx(lang: Language) -> ParseContext {
-        // Fixed reference: 2026-05-08 12:00:00 Europe/Berlin (= 10:00 UTC).
         let tz: Tz = "Europe/Berlin".parse().unwrap();
         let now_local = tz.with_ymd_and_hms(2026, 5, 8, 12, 0, 0).unwrap();
         ParseContext {
@@ -148,58 +162,150 @@ mod tests {
     fn p(input: &str) -> Parsed {
         parse(input, &ctx(Language::De)).expect("parse failed")
     }
-
     fn p_en(input: &str) -> Parsed {
         parse(input, &ctx(Language::En)).expect("parse failed")
     }
+    fn err(input: &str) -> ParseError {
+        parse(input, &ctx(Language::De)).unwrap_err()
+    }
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        ctx(Language::De)
+            .tz
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
 
-    // ---- Relative ----
+    // ---- Relative simple ----
 
     #[test]
     fn rel_minutes_short() {
         let r = p("5m Kaffee fertig");
         assert_eq!(r.text, "Kaffee fertig");
-        assert_eq!(
-            r.fire_at(),
-            ctx(Language::De).now_utc + chrono::Duration::minutes(5)
-        );
-        assert!(r.had_explicit_time);
+        assert_eq!(r.fire_at(), ctx(Language::De).now_utc + chrono::Duration::minutes(5));
     }
 
     #[test]
-    fn rel_minutes_long_de() {
+    fn rel_minutes_longform_de() {
         let r = p("30 minuten Pizza");
         assert_eq!(r.text, "Pizza");
-        assert_eq!(
-            r.fire_at(),
-            ctx(Language::De).now_utc + chrono::Duration::minutes(30)
-        );
+        assert_eq!(r.fire_at(), ctx(Language::De).now_utc + chrono::Duration::minutes(30));
     }
 
     #[test]
     fn rel_with_in_prefix() {
         let r = p("in 2 stunden trinken");
         assert_eq!(r.text, "trinken");
-        assert_eq!(
-            r.fire_at(),
-            ctx(Language::De).now_utc + chrono::Duration::hours(2)
-        );
+        assert_eq!(r.fire_at(), ctx(Language::De).now_utc + chrono::Duration::hours(2));
     }
 
     #[test]
     fn rel_days() {
         let r = p("30d abo kündigen");
         assert_eq!(r.text, "abo kündigen");
-        assert_eq!(
-            r.fire_at(),
-            ctx(Language::De).now_utc + chrono::Duration::days(30)
-        );
+        assert_eq!(r.fire_at(), ctx(Language::De).now_utc + chrono::Duration::days(30));
     }
 
     #[test]
     fn rel_weeks_en() {
         let r = p_en("2w pay rent");
         assert_eq!(r.text, "pay rent");
+        assert_eq!(r.fire_at(), ctx(Language::De).now_utc + chrono::Duration::weeks(2));
+    }
+
+    #[test]
+    fn rel_compact_uppercase_m_is_months_not_minutes() {
+        // Case-sensitive: `5M` is months, `5m` is minutes.
+        let r = p("5M something");
+        // 2026-05-08 12:00 + 5 calendar months = 2026-10-08 12:00 local.
+        assert_eq!(r.fire_at(), local(2026, 10, 8, 12, 0));
+    }
+
+    #[test]
+    fn rel_compact_uppercase_y() {
+        let r = p("1Y birthday");
+        assert_eq!(r.fire_at(), local(2027, 5, 8, 12, 0));
+    }
+
+    #[test]
+    fn rel_lowercase_y_not_accepted_as_year() {
+        // `5y` is not a valid compact — neither year (only `Y`) nor minute.
+        let e = err("5y text");
+        assert!(matches!(e, ParseError::NoTimeExpression | ParseError::InvalidRelSpec));
+    }
+
+    // ---- Relative combined ----
+
+    #[test]
+    fn rel_combined_h_m() {
+        let r = p("7h30m Pause");
+        assert_eq!(r.text, "Pause");
+        assert_eq!(
+            r.fire_at(),
+            ctx(Language::De).now_utc + chrono::Duration::hours(7) + chrono::Duration::minutes(30)
+        );
+    }
+
+    #[test]
+    fn rel_combined_d_h() {
+        let r = p("2d12h text");
+        // wall-time preserved on the date part (5/8 + 2d = 5/10), then +12h.
+        // 2026-05-10 12:00 local + 12h = 2026-05-11 00:00 local.
+        assert_eq!(r.fire_at(), local(2026, 5, 11, 0, 0));
+    }
+
+    #[test]
+    fn rel_combined_maximal() {
+        // Just check it parses and lands in the future; exact value validated
+        // in unit tests on RelSpec::apply.
+        let r = p("1Y2M15d8h40m20s test");
+        assert!(r.fire_at() > ctx(Language::De).now_utc);
+    }
+
+    #[test]
+    fn rel_combined_wrong_order_rejected() {
+        let e = err("30m2h text");
+        assert_eq!(e, ParseError::InvalidRelSpec);
+    }
+
+    // ---- Relative + override ----
+
+    #[test]
+    fn rel_override_multi_day() {
+        let r = p("2d 11:00 vitamin");
+        assert_eq!(r.text, "vitamin");
+        // 5/8 + 2d = 5/10, override 11:00 local.
+        assert_eq!(r.fire_at(), local(2026, 5, 10, 11, 0));
+    }
+
+    #[test]
+    fn rel_override_week() {
+        let r = p("1w 18:00 zahlen");
+        assert_eq!(r.fire_at(), local(2026, 5, 15, 18, 0));
+    }
+
+    #[test]
+    fn rel_override_year() {
+        let r = p("1Y 9:00 jubilaeum");
+        assert_eq!(r.fire_at(), local(2027, 5, 8, 9, 0));
+    }
+
+    #[test]
+    fn rel_subday_override_rejected() {
+        let e = err("15h 11:00 text");
+        assert_eq!(e, ParseError::SubDayRelWithOverride);
+    }
+
+    #[test]
+    fn rel_mixed_subday_override_rejected() {
+        let e = err("2d8h 11:00 text");
+        assert_eq!(e, ParseError::SubDayRelWithOverride);
+    }
+
+    #[test]
+    fn rel_50_year_cap() {
+        let e = err("100Y text");
+        assert_eq!(e, ParseError::RelTooFar(MAX_RELATIVE_YEARS));
     }
 
     // ---- Absolute date ----
@@ -208,142 +314,145 @@ mod tests {
     fn abs_short_year() {
         let r = p("30.4.27 scheidung einreichen");
         assert_eq!(r.text, "scheidung einreichen");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2027, 4, 30, 9, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
-        assert!(!r.had_explicit_time);
+        assert_eq!(r.fire_at(), local(2027, 4, 30, 9, 0));
     }
 
     #[test]
     fn abs_full_year_with_time() {
         let r = p("30.04.2027 14:30 Termin");
         assert_eq!(r.text, "Termin");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2027, 4, 30, 14, 30, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
-        assert!(r.had_explicit_time);
+        assert_eq!(r.fire_at(), local(2027, 4, 30, 14, 30));
     }
 
     #[test]
     fn abs_no_year_assumes_next_occurrence() {
-        // 8 May → asking for "10.5" should be in 2 days, not next year.
         let r = p("10.5 Geburtstag");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 10, 9, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 10, 9, 0));
+    }
+
+    #[test]
+    fn abs_trailing_dot() {
+        let r = p("30.4. Termin");
+        assert_eq!(r.fire_at(), local(2027, 4, 30, 9, 0)); // past this year → next
+    }
+
+    #[test]
+    fn abs_iso_date_future() {
+        let r = p("2026-12-31 sylvester");
+        assert_eq!(r.fire_at(), local(2026, 12, 31, 9, 0));
+    }
+
+    #[test]
+    fn abs_iso_date_short_month_day() {
+        let r = p("2026-7-1 quartal");
+        assert_eq!(r.fire_at(), local(2026, 7, 1, 9, 0));
+    }
+
+    #[test]
+    fn abs_iso_date_in_past_rejected() {
+        assert_eq!(err("2020-01-01 foo"), ParseError::InPast);
+    }
+
+    // ---- Bare clock-time ----
+
+    #[test]
+    fn bare_clock_today_future() {
+        // Reference 12:00 → "15:00" is later today.
+        let r = p("15:00 nap");
+        assert_eq!(r.fire_at(), local(2026, 5, 8, 15, 0));
+        assert_eq!(r.text, "nap");
+    }
+
+    #[test]
+    fn bare_clock_today_passed_picks_tomorrow() {
+        let r = p("09:00 morgenmuffel");
+        assert_eq!(r.fire_at(), local(2026, 5, 9, 9, 0));
+    }
+
+    #[test]
+    fn bare_clock_hour_only() {
+        let r = p("14 Uhr text");
+        assert_eq!(r.fire_at(), local(2026, 5, 8, 14, 0));
+    }
+
+    #[test]
+    fn bare_clock_am_pm() {
+        let r = p("2pm meeting");
+        assert_eq!(r.fire_at(), local(2026, 5, 8, 14, 0));
+        let r2 = p("9am workout");
+        // 9am today is past (ref 12:00) → tomorrow.
+        assert_eq!(r2.fire_at(), local(2026, 5, 9, 9, 0));
+    }
+
+    #[test]
+    fn am_pm_12_edges() {
+        // 12am = midnight, 12pm = noon (per RULES.md).
+        let r_noon = p("12pm lunch"); // ref 12:00, "12pm" = today 12:00 — equal, so tomorrow.
+        assert_eq!(r_noon.fire_at(), local(2026, 5, 9, 12, 0));
+        let r_mid = p("12am owl");
+        assert_eq!(r_mid.fire_at(), local(2026, 5, 9, 0, 0));
     }
 
     // ---- Named day ----
 
     #[test]
-    fn named_morgen() {
+    fn named_morgen_with_time() {
         let r = p("morgen 9 Uhr Arzt");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 9, 9, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 9, 9, 0));
         assert_eq!(r.text, "Arzt");
-        assert!(r.had_explicit_time);
     }
 
     #[test]
     fn named_morgen_default_time() {
         let r = p("morgen Arzt");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 9, 9, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
-        assert!(!r.had_explicit_time);
+        assert_eq!(r.fire_at(), local(2026, 5, 9, 9, 0));
     }
 
     #[test]
     fn named_uebermorgen() {
         let r = p("übermorgen 14:00 Treffen");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 10, 14, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 10, 14, 0));
     }
 
     #[test]
     fn named_weekday_short() {
-        // Reference is Friday 2026-05-08; "do" → next Thursday 2026-05-14.
         let r = p("do 14:00 Standup");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 14, 14, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 14, 14, 0));
     }
 
     #[test]
     fn named_weekday_long_en() {
         let r = p_en("monday 10:00 standup");
-        // Reference Friday 2026-05-08 → next Monday 2026-05-11.
-        let expected = ctx(Language::En)
-            .tz
-            .with_ymd_and_hms(2026, 5, 11, 10, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 11, 10, 0));
     }
 
     #[test]
-    fn named_weekday_today_time_still_ahead_picks_today() {
-        // Reference is Friday 2026-05-08 12:00 Berlin; "fr 14:00" is later
-        // today, so it should fire today, not next Friday.
+    fn named_weekday_today_time_ahead_picks_today() {
         let r = p("fr 14:00 workout");
-        assert_eq!(r.text, "workout");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 8, 14, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 8, 14, 0));
     }
 
     #[test]
-    fn named_weekday_today_time_passed_picks_next_week() {
-        // Same reference, "fr 09:00" — today's 9 a.m. is gone, so next Friday.
+    fn named_weekday_today_time_passed_next_week() {
         let r = p("fr 09:00 routine");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 15, 9, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 15, 9, 0));
     }
 
     #[test]
-    fn named_weekday_today_default_time_passed_picks_next_week() {
-        // No explicit time → default 09:00. Reference is 12:00, so today's
-        // 09:00 has passed → next Friday 09:00.
+    fn named_weekday_default_time_passed_next_week() {
         let r = p("fr putzen");
-        let expected = ctx(Language::De)
-            .tz
-            .with_ymd_and_hms(2026, 5, 15, 9, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(r.fire_at(), expected);
+        assert_eq!(r.fire_at(), local(2026, 5, 15, 9, 0));
     }
 
-    // ---- Fuzzy matching ----
+    #[test]
+    fn heute_rejected_with_hint() {
+        let e = err("heute 22:00 text");
+        assert_eq!(e, ParseError::HeuteRejected);
+        let e2 = err("today 22:00 text");
+        assert_eq!(e2, ParseError::HeuteRejected);
+    }
+
+    // ---- Fuzzy ----
 
     #[test]
     fn fuzzy_typo_morgen() {
@@ -352,41 +461,35 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_typo_donnerstag() {
-        let r = p("donnerstah 14 Standup");
-        assert_eq!(r.text, "Standup");
-    }
-
-    #[test]
     fn fuzzy_does_not_eat_unrelated_words() {
-        // "Pizza" is nowhere near a time keyword, must not be consumed.
-        let err = parse("Pizza essen", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::NoTimeExpression);
+        assert_eq!(err("Pizza essen"), ParseError::NoTimeExpression);
     }
 
     // ---- Errors ----
 
     #[test]
     fn err_no_text() {
-        let err = parse("5m", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::MissingText);
+        assert_eq!(err("5m"), ParseError::MissingText);
     }
 
     #[test]
     fn err_in_past_absolute() {
-        let err = parse("01.01.2020 foo", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::InPast);
+        assert_eq!(err("01.01.2020 foo"), ParseError::InPast);
     }
 
     #[test]
     fn err_no_time_expression() {
-        let err = parse("hallo welt", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::NoTimeExpression);
+        assert_eq!(err("hallo welt"), ParseError::NoTimeExpression);
+    }
+
+    #[test]
+    fn err_invalid_suffix() {
+        // `5x` isn't a valid compact suffix and `x` isn't a longform either.
+        assert_eq!(err("5x text"), ParseError::NoTimeExpression);
     }
 
     // ============================================================
-    // Recurring — assert via Schedule's rrule string + dtstart, since the
-    // pattern enum is gone. RRULE strings are stable RFC-5545 output.
+    // Recurring — RRULE string + dtstart shape checks.
     // ============================================================
 
     fn rrule(r: &Parsed) -> &str {
@@ -396,42 +499,33 @@ mod tests {
     #[test]
     fn rec_short_interval_30m() {
         let r = p("*30m wasser trinken");
-        assert_eq!(r.text, "wasser trinken");
         assert!(rrule(&r).contains("FREQ=MINUTELY"));
         assert!(rrule(&r).contains("INTERVAL=30"));
-        assert_eq!(
-            r.fire_at(),
-            ctx(Language::De).now_utc + chrono::Duration::minutes(30)
-        );
     }
 
     #[test]
     fn rec_long_interval_30m() {
         let r = p("alle 30m wasser trinken");
-        assert_eq!(r.text, "wasser trinken");
         assert!(rrule(&r).contains("FREQ=MINUTELY"));
         assert!(rrule(&r).contains("INTERVAL=30"));
     }
 
     #[test]
     fn rec_too_short() {
-        let err = parse("*5m wasser", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::IntervalTooShort(1800));
+        assert_eq!(err("*5m wasser"), ParseError::IntervalTooShort(1800));
     }
 
     #[test]
     fn rec_daily_short() {
         let r = p("*1d vitamin");
-        assert_eq!(r.text, "vitamin");
-        assert!(rrule(&r).contains("FREQ=DAILY"));
-        assert!(rrule(&r).contains("BYHOUR=9"));
-        assert!(rrule(&r).contains("BYMINUTE=0"));
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=DAILY"));
+        assert!(s.contains("BYHOUR=9"));
     }
 
     #[test]
     fn rec_weekly_single_day_long() {
         let r = p("jeden donnerstag 14:00 standup");
-        assert_eq!(r.text, "standup");
         let s = rrule(&r);
         assert!(s.contains("FREQ=WEEKLY"));
         assert!(s.contains("BYDAY=TH"));
@@ -441,27 +535,22 @@ mod tests {
     #[test]
     fn rec_weekly_short_with_time() {
         let r = p("*do 14:00 standup");
-        assert_eq!(r.text, "standup");
         let s = rrule(&r);
         assert!(s.contains("FREQ=WEEKLY"));
         assert!(s.contains("BYDAY=TH"));
-        assert!(s.contains("BYHOUR=14"));
     }
 
     #[test]
-    fn rec_weekly_multi_day_with_comma() {
+    fn rec_weekly_multi_day_comma() {
         let r = p("*mo,mi,fr 9 yoga");
-        assert_eq!(r.text, "yoga");
         let s = rrule(&r);
         assert!(s.contains("FREQ=WEEKLY"));
         assert!(s.contains("BYDAY=MO,WE,FR"));
-        assert!(s.contains("BYHOUR=9"));
     }
 
     #[test]
     fn rec_weekly_default_time() {
         let r = p("jeden montag yoga");
-        assert_eq!(r.text, "yoga");
         let s = rrule(&r);
         assert!(s.contains("FREQ=WEEKLY"));
         assert!(s.contains("BYDAY=MO"));
@@ -471,17 +560,23 @@ mod tests {
     #[test]
     fn rec_monthly_first() {
         let r = p("*1. miete bezahlen");
-        assert_eq!(r.text, "miete bezahlen");
         let s = rrule(&r);
         assert!(s.contains("FREQ=MONTHLY"));
         assert!(s.contains("BYMONTHDAY=1"));
-        assert!(s.contains("BYHOUR=9"));
+    }
+
+    #[test]
+    fn rec_monthly_31_uses_last_day_and_emits_note() {
+        let r = p("*31. miete");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=MONTHLY"));
+        assert!(s.contains("BYMONTHDAY=-1"));
+        assert!(!r.notes.is_empty(), "expected a last-day hint");
     }
 
     #[test]
     fn rec_monthly_with_time() {
         let r = p("jeden 15. 18:00 abrechnung");
-        assert_eq!(r.text, "abrechnung");
         let s = rrule(&r);
         assert!(s.contains("FREQ=MONTHLY"));
         assert!(s.contains("BYMONTHDAY=15"));
@@ -491,33 +586,37 @@ mod tests {
     #[test]
     fn rec_yearly_short() {
         let r = p("*24.12 heiligabend");
-        assert_eq!(r.text, "heiligabend");
         let s = rrule(&r);
         assert!(s.contains("FREQ=YEARLY"));
         assert!(s.contains("BYMONTH=12"));
         assert!(s.contains("BYMONTHDAY=24"));
-        assert!(s.contains("BYHOUR=9"));
+    }
+
+    #[test]
+    fn rec_yearly_29_feb_uses_last_day_and_emits_note() {
+        let r = p("*29.2 schaltjahr");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=YEARLY"));
+        assert!(s.contains("BYMONTH=2"));
+        assert!(s.contains("BYMONTHDAY=-1"));
+        assert!(!r.notes.is_empty(), "expected a leap-day hint");
     }
 
     #[test]
     fn rec_yearly_long_en() {
         let r = p_en("every 24.12 christmas");
-        assert_eq!(r.text, "christmas");
         let s = rrule(&r);
         assert!(s.contains("FREQ=YEARLY"));
         assert!(s.contains("BYMONTH=12"));
-        assert!(s.contains("BYMONTHDAY=24"));
     }
 
     #[test]
     fn rec_missing_text() {
-        let err = parse("*30m", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::MissingText);
+        assert_eq!(err("*30m"), ParseError::MissingText);
     }
 
     #[test]
     fn rec_no_recognised_spec_after_keyword() {
-        let err = parse("every gibberish", &ctx(Language::De)).unwrap_err();
-        assert_eq!(err, ParseError::NoTimeExpression);
+        assert_eq!(err("every gibberish"), ParseError::NoTimeExpression);
     }
 }

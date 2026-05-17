@@ -152,10 +152,10 @@ impl Schedule {
         Self::recurring(dtstart, tz, rule)
     }
 
-    /// Monthly on a given day-of-month at fixed wall-clock time.
-    /// Months without that day fire on the last day (RRULE BYMONTHDAY=-1
-    /// would do that natively; for simplicity we just use the positive day
-    /// and let the expander skip — see TODO below for the user-visible hint).
+    /// Monthly on a specific day-of-month at fixed wall-clock time. Strict:
+    /// months without that day are skipped (so `day=31` skips Feb/Apr/Jun/
+    /// Sep/Nov). For "last day of month with fallback" semantics — what
+    /// `*31.` means per RULES.md — use [`Self::monthly_last_day`] instead.
     pub fn monthly(
         dtstart: DateTime<Utc>,
         tz: Tz,
@@ -169,7 +169,31 @@ impl Schedule {
         Self::recurring(dtstart, tz, rule)
     }
 
+    /// Monthly on the last day of every month (`BYMONTHDAY=-1`). This is
+    /// what `*31.` resolves to per RULES.md — in February it lands on the
+    /// 28th/29th, otherwise the 30th/31st.
+    ///
+    /// rrule 0.14's `Display` impl drops negative-BYMONTHDAY values during
+    /// serialization (it only emits the positive `by_month_day` field, not the
+    /// `by_n_month_day` sibling that validation moves them into). So we build
+    /// the canonical string ourselves and validate it by re-parsing.
+    pub fn monthly_last_day(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        let rrule_str = format!(
+            "FREQ=MONTHLY;BYMONTHDAY=-1;BYHOUR={};BYMINUTE={}",
+            time.hour(),
+            time.minute()
+        );
+        Self::from_canonical_string(dtstart, tz, rrule_str)
+    }
+
     /// Yearly on a fixed month + day-of-month at fixed wall-clock time.
+    /// Strict: non-existent dates (e.g. `Feb 29` in non-leap years) are
+    /// skipped. For `*29.2` semantics — last day of February every year —
+    /// use [`Self::yearly_last_day_of_month`].
     pub fn yearly(
         dtstart: DateTime<Utc>,
         tz: Tz,
@@ -185,6 +209,46 @@ impl Schedule {
             .by_hour(vec![time.hour() as u8])
             .by_minute(vec![time.minute() as u8]);
         Self::recurring(dtstart, tz, rule)
+    }
+
+    /// Yearly on the last day of a specific month (`BYMONTH=M;BYMONTHDAY=-1`).
+    /// Used for `*29.2` — every year on Feb 28/29. Same upstream-string-bug
+    /// workaround as [`Self::monthly_last_day`].
+    pub fn yearly_last_day_of_month(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        month: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        if !(1..=12).contains(&month) {
+            return Err(ScheduleError::Invalid(format!("invalid month {month}")));
+        }
+        let rrule_str = format!(
+            "FREQ=YEARLY;BYMONTH={month};BYMONTHDAY=-1;BYHOUR={};BYMINUTE={}",
+            time.hour(),
+            time.minute()
+        );
+        Self::from_canonical_string(dtstart, tz, rrule_str)
+    }
+
+    /// Validate a hand-built RRULE string by parsing + validating it, then
+    /// keep the original string verbatim (since rrule 0.14's `Display` is lossy
+    /// for `by_n_month_day`). Returns Err if parsing or validation fails.
+    fn from_canonical_string(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        rrule_str: String,
+    ) -> Result<Self, ScheduleError> {
+        let rule: RRule<Unvalidated> = rrule_str
+            .parse()
+            .map_err(|e| ScheduleError::Invalid(format!("parse {rrule_str:?}: {e}")))?;
+        let dts_rrule = dtstart.with_timezone(&rrule::Tz::from(tz));
+        rule.validate(dts_rrule)?;
+        Ok(Self {
+            dtstart,
+            tz,
+            rrule: Some(rrule_str),
+        })
     }
 }
 
@@ -381,6 +445,33 @@ mod tests {
         assert_eq!(
             s.next_after(local(2026, 5, 8, 10, 0)),
             Some(local(2026, 5, 11, 9, 0))
+        );
+    }
+
+    // ---- Monthly last-day ----
+
+    #[test]
+    fn monthly_last_day_skips_short_months_correctly() {
+        // Anchor on Jan 31. Next fire after Jan 31 should be Feb 28 (2026 not leap).
+        let dts = local(2026, 1, 31, 9, 0);
+        let s = Schedule::monthly_last_day(dts, berlin(), t(9, 0)).unwrap();
+        assert!(s.rrule.as_deref().unwrap().contains("BYMONTHDAY=-1"));
+        assert_eq!(
+            s.next_after(local(2026, 1, 31, 10, 0)),
+            Some(local(2026, 2, 28, 9, 0))
+        );
+    }
+
+    #[test]
+    fn yearly_last_day_of_feb_uses_feb_29_in_leap() {
+        // Anchor in 2027 (non-leap) → Feb 28; advance to 2028 (leap) → Feb 29.
+        let dts = local(2027, 2, 28, 9, 0);
+        let s = Schedule::yearly_last_day_of_month(dts, berlin(), 2, t(9, 0)).unwrap();
+        assert!(s.rrule.as_deref().unwrap().contains("BYMONTH=2"));
+        assert!(s.rrule.as_deref().unwrap().contains("BYMONTHDAY=-1"));
+        assert_eq!(
+            s.next_after(local(2027, 2, 28, 10, 0)),
+            Some(local(2028, 2, 29, 9, 0))
         );
     }
 

@@ -79,12 +79,24 @@ async fn create_alert(
     let parsed = match parser::parse(text, &ctx) {
         Ok(p) => p,
         Err(e) => {
-            let reply = match e {
+            let reply: String = match e {
                 parser::ParseError::Empty | parser::ParseError::MissingText => {
-                    m::parse_error_missing_text(user.language)
+                    m::parse_error_missing_text(user.language).to_string()
                 }
-                parser::ParseError::InPast => m::parse_error_in_past(user.language),
-                _ => m::parse_error_unknown(user.language),
+                parser::ParseError::InPast => m::parse_error_in_past(user.language).to_string(),
+                parser::ParseError::HeuteRejected => {
+                    m::parse_error_heute_rejected(user.language).to_string()
+                }
+                parser::ParseError::SubDayRelWithOverride => {
+                    m::parse_error_subday_override(user.language).to_string()
+                }
+                parser::ParseError::RelTooFar(y) => {
+                    m::parse_error_rel_too_far(user.language, y)
+                }
+                parser::ParseError::InvalidRelSpec => {
+                    m::parse_error_invalid_rel_spec(user.language).to_string()
+                }
+                _ => m::parse_error_unknown(user.language).to_string(),
             };
             bot.send_message(msg.chat.id, reply)
                 .parse_mode(ParseMode::Html)
@@ -108,7 +120,7 @@ async fn create_alert(
     let when = render::format_local_short(alert.fire_at, user.timezone, user.language);
     let recurrence_short = render::format_recurrence_short(&alert.schedule, user.language);
     let recurrence_str = recurrence_short.as_deref();
-    let reply = match scope {
+    let mut reply = match scope {
         AlertScope::Private => m::alert_confirmation(user.language, &when, alert.id, recurrence_str),
         AlertScope::Shared => {
             let handle = msg
@@ -131,6 +143,11 @@ async fn create_alert(
             )
         }
     };
+
+    for note in &parsed.notes {
+        reply.push('\n');
+        reply.push_str(&html_escape(note));
+    }
 
     bot.send_message(msg.chat.id, reply)
         .reply_markup(action_keyboard(user.language, alert.id))
