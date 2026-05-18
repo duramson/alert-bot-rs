@@ -205,14 +205,25 @@ fn init_tracing() {
         .init();
 }
 
-/// Reqwest client tuned for long-lived HTTPS connections to api.telegram.org.
-/// Adds TCP keepalive (so dead conns are detected proactively instead of on
-/// the next request) and an aggressive idle timeout (so the pool recycles
-/// before NAT timeouts kick in). Defaults inherited from
-/// `teloxide::net::default_reqwest_settings` for the connect/request timeouts.
+/// Reqwest client tuned for outbound HTTPS to api.telegram.org.
+///
+/// Three knobs, in order of how much they actually matter:
+///
+/// 1. **Force IPv4** via `local_address(0.0.0.0)`. Our LXC has a broken
+///    IPv6 path — `getaddrinfo` returns the AAAA first, hyper tries it,
+///    and the 5s `connect_timeout` expires before the IPv4 fallback gets
+///    a turn (hyper 0.14 applies `connect_timeout` to the *entire* address
+///    iteration, not per attempt). Symptom was `hyper::Error(Connect,
+///    TimedOut)` on the first request after any idle period.
+/// 2. **TCP keepalive** so half-dead pooled connections get detected
+///    proactively instead of on the next user-facing send.
+/// 3. **Short `pool_idle_timeout`** so connections recycle before any
+///    NAT/conntrack timeouts on the path can silently kill them.
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
     let client = reqwest::Client::builder()
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(17))
         .tcp_nodelay(true)
