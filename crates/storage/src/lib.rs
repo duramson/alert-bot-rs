@@ -335,6 +335,44 @@ impl PgStore {
 }
 
 // ---------------------------------------------------------------------------
+// Stats (read-only snapshot for external dashboards, e.g. Homepage)
+// ---------------------------------------------------------------------------
+
+/// Aggregate counts for the stats endpoint. All `count(*)` values → `i64`.
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    pub users: i64,
+    /// pending + claimed — everything not yet delivered, cancelled, or failed.
+    pub active: i64,
+    pub sent: i64,
+    pub total: i64,
+}
+
+impl PgStore {
+    /// One-shot aggregate snapshot for dashboards. Cheap: four counts in a
+    /// single round-trip.
+    pub async fn stats(&self) -> Result<Stats> {
+        let row: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT count(*) FROM users),
+                (SELECT count(*) FROM alerts WHERE state IN ('pending', 'claimed')),
+                (SELECT count(*) FROM alerts WHERE state = 'sent'),
+                (SELECT count(*) FROM alerts)
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Stats {
+            users: row.0,
+            active: row.1,
+            sent: row.2,
+            total: row.3,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Row → domain mapping
 // ---------------------------------------------------------------------------
 

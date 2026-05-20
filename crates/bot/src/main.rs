@@ -19,6 +19,7 @@ mod commands;
 mod handlers;
 mod messages;
 mod render;
+mod stats;
 mod worker;
 
 use admin::AdminNotifier;
@@ -60,6 +61,18 @@ async fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         tokio::spawn(async move { worker::run(bot, store, shutdown).await })
     };
+
+    // Opt-in read-only stats endpoint (Homepage widget). Separate axum server
+    // on its own LAN-only port — doesn't touch the webhook listener below.
+    if let Some(addr) = config.stats_listen {
+        let store = store.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stats::run(store, addr, shutdown).await {
+                tracing::error!(error = ?e, "stats server exited with error");
+            }
+        });
+    }
 
     let handler = dptree::entry()
         // Telegram retries webhook deliveries on timeout — drop duplicates by
@@ -149,6 +162,9 @@ struct Config {
     database_url: String,
     transport: Transport,
     admin_chat_id: Option<i64>,
+    /// Optional LAN-only address for the read-only `/stats` endpoint. `None`
+    /// (env unset) means the stats server doesn't start at all.
+    stats_listen: Option<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -187,11 +203,20 @@ impl Config {
             ),
         };
 
+        let stats_listen = match std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()) {
+            None => None,
+            Some(s) => Some(
+                s.parse::<SocketAddr>()
+                    .context("STATS_LISTEN is not a valid socket address")?,
+            ),
+        };
+
         Ok(Self {
             bot_token,
             database_url,
             transport,
             admin_chat_id,
+            stats_listen,
         })
     }
 }

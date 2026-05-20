@@ -18,6 +18,7 @@ dependencies = [
  "alert-bot-core",
  "alert-bot-storage",
  "anyhow",
+ "axum",
  "chrono",
  "chrono-tz",
  "dotenvy",
