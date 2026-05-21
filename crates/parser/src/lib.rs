@@ -243,10 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn rel_lowercase_y_not_accepted_as_year() {
-        // `5y` is not a valid compact — neither year (only `Y`) nor minute.
-        let e = err("5y text");
-        assert!(matches!(e, ParseError::NoTimeExpression | ParseError::InvalidRelSpec));
+    fn rel_lowercase_y_accepted_as_year() {
+        // `y` and `Y` both mean year — no minute/month-style collision, so we
+        // accept the lowercase form (`5y` reads naturally).
+        let r = p("5y text");
+        assert_eq!(r.fire_at(), local(2031, 5, 8, 12, 0));
     }
 
     // ---- Relative combined ----
@@ -532,10 +533,12 @@ mod tests {
 
     #[test]
     fn rec_daily_short() {
+        // Relative recurrence fires at creation time (reference clock = 12:00),
+        // not the 09:00 date-default.
         let r = p("*1d vitamin");
         let s = rrule(&r);
         assert!(s.contains("FREQ=DAILY"));
-        assert!(s.contains("BYHOUR=9"));
+        assert!(s.contains("BYHOUR=12"));
     }
 
     #[test]
@@ -623,6 +626,69 @@ mod tests {
         let s = rrule(&r);
         assert!(s.contains("FREQ=YEARLY"));
         assert!(s.contains("BYMONTH=12"));
+    }
+
+    // ---- Recurring relative Y/M (calendar frequency) ----
+
+    #[test]
+    fn rec_relative_yearly() {
+        // *1Y on May 8 == yearly on 8 May at creation time (12:00). First fire
+        // is next year — today's 12:00 is the creation instant, not future.
+        let r = p("*1Y FIT-Test machen");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=YEARLY"));
+        assert!(s.contains("BYMONTH=5"));
+        assert!(s.contains("BYMONTHDAY=8"));
+        assert!(s.contains("BYHOUR=12"));
+        assert_eq!(r.fire_at(), local(2027, 5, 8, 12, 0));
+    }
+
+    #[test]
+    fn rec_relative_yearly_lowercase_y() {
+        // y and Y both mean year — no collision (unlike m/M).
+        let r = p("*1y vorsorge");
+        assert!(rrule(&r).contains("FREQ=YEARLY"));
+    }
+
+    #[test]
+    fn rec_relative_every_two_years() {
+        let r = p("*2Y tüv");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=YEARLY"));
+        assert!(s.contains("INTERVAL=2"));
+    }
+
+    #[test]
+    fn rec_relative_monthly() {
+        // *1M on the 8th == monthly on the 8th at creation time (12:00). First
+        // fire next month — today's 12:00 is the creation instant.
+        let r = p("*1M zählerstand");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=MONTHLY"));
+        assert!(s.contains("BYMONTHDAY=8"));
+        assert!(s.contains("BYHOUR=12"));
+        assert_eq!(r.fire_at(), local(2026, 6, 8, 12, 0));
+    }
+
+    #[test]
+    fn rec_relative_every_three_months() {
+        let r = p("*3M quartalsbericht");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=MONTHLY"));
+        assert!(s.contains("INTERVAL=3"));
+    }
+
+    #[test]
+    fn rec_relative_mixed_year_month_rejected() {
+        assert_eq!(err("*1Y2M unsinn"), ParseError::InvalidRecurrenceSpec);
+        // Lowercase y mixes the same way — case of the year suffix is irrelevant
+        // to the family check.
+        assert_eq!(err("*1y2M unsinn"), ParseError::InvalidRecurrenceSpec);
+    }
+
+    #[test]
+    fn rec_relative_mixed_year_subday_rejected() {
+        assert_eq!(err("*1Y3d unsinn"), ParseError::InvalidRecurrenceSpec);
     }
 
     #[test]

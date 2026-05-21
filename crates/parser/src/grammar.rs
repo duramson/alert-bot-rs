@@ -707,8 +707,40 @@ fn try_recurring_relative(
     let Some((spec, _end_idx, end_offset)) = try_relative_match(tokens)? else {
         return Ok(None);
     };
-    if spec.years > 0 || spec.months > 0 {
+
+    // Top rule (RULES.md): every relative recurrence repeats at the wall-clock
+    // time the command was sent — `*30m`/`*2d`/`*1M`/`*1Y` all fire at creation
+    // time, the calendar ones additionally keeping the same day-of-month /
+    // day-of-year.
+    let creation_time = ctx.now_utc.with_timezone(&ctx.tz).time();
+
+    // A spec maps onto exactly one RRULE FREQ family: yearly, monthly, or the
+    // seconds/day interval. Mixing them (`*1Y2M`, `*1Y3d`) has no single FREQ,
+    // so reject rather than silently dropping a component.
+    let interval_units = spec.weeks > 0 || spec.days > 0 || spec.has_sub_day();
+    let families = (spec.years > 0) as u8 + (spec.months > 0) as u8 + interval_units as u8;
+    if families > 1 {
         return Err(ParseError::InvalidRecurrenceSpec);
+    }
+
+    // *1Y / *2Y → yearly on today's month+day, so `*1Y` == `*8.5` here.
+    if spec.years > 0 {
+        let interval = u16::try_from(spec.years).map_err(|_| ParseError::InvalidRecurrenceSpec)?;
+        let today = today_local(ctx);
+        let (month, day) = (today.month() as u8, today.day() as u8);
+        let dtstart = next_dtstart_for_yearly(month, day, creation_time, ctx);
+        let schedule =
+            Schedule::yearly_every(dtstart, ctx.tz, interval, month, day, creation_time)?;
+        return Ok(Some((schedule, end_offset, None)));
+    }
+    // *1M / *3M → monthly on today's day-of-month, so `*1M` == `*8.` here.
+    if spec.months > 0 {
+        let interval = u16::try_from(spec.months).map_err(|_| ParseError::InvalidRecurrenceSpec)?;
+        let today = today_local(ctx);
+        let day = today.day() as u8;
+        let dtstart = next_dtstart_for_monthly(day, creation_time, ctx);
+        let schedule = Schedule::monthly_every(dtstart, ctx.tz, interval, day, creation_time)?;
+        return Ok(Some((schedule, end_offset, None)));
     }
 
     let total_secs = spec.weeks as i64 * 7 * 86_400
@@ -721,10 +753,13 @@ fn try_recurring_relative(
         return Err(ParseError::IntervalTooShort(MIN_INTERVAL_SECONDS));
     }
 
+    // Whole-day multiples use a DST-safe wall-clock daily rule; sub-day
+    // intervals use an exact seconds rule anchored at now (so `*30m` stays
+    // exactly 30 min apart even across a DST jump).
     let schedule = if total_secs % 86_400 == 0 {
         let every_n_days = (total_secs / 86_400) as u16;
-        let dtstart = next_dtstart_for_daily(every_n_days, DEFAULT_TIME, ctx);
-        Schedule::daily_at(dtstart, ctx.tz, every_n_days, DEFAULT_TIME)?
+        let dtstart = next_dtstart_for_daily(every_n_days, creation_time, ctx);
+        Schedule::daily_at(dtstart, ctx.tz, every_n_days, creation_time)?
     } else {
         let dtstart = ctx.now_utc + Duration::seconds(total_secs);
         Schedule::interval_seconds(dtstart, ctx.tz, total_secs)?

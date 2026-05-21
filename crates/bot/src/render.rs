@@ -107,9 +107,9 @@ pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<St
             let by_weekday = rule.get_by_weekday();
             let mut day_strs: Vec<&str> = by_weekday
                 .iter()
-                .filter_map(|nw| match nw {
-                    NWeekday::Every(d) => Some(weekday_short(*d, lang)),
-                    NWeekday::Nth(_, d) => Some(weekday_short(*d, lang)),
+                .map(|nw| match nw {
+                    NWeekday::Every(d) => weekday_short(*d, lang),
+                    NWeekday::Nth(_, d) => weekday_short(*d, lang),
                 })
                 .collect();
             if day_strs.is_empty() {
@@ -126,18 +126,24 @@ pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<St
         }
         Frequency::Monthly => {
             let day = rule.get_by_month_day().first().copied().unwrap_or(1);
-            match lang {
-                Language::De => format!("jeden {day}. {hm}"),
-                Language::En => format!("monthly on {day}. {hm}"),
+            match (interval, lang) {
+                (1, Language::De) => format!("jeden {day}. {hm}"),
+                (1, Language::En) => format!("monthly on {day}. {hm}"),
+                (n, Language::De) => format!("alle {n} Monate, {day}. {hm}"),
+                (n, Language::En) => format!("every {n} months on {day}. {hm}"),
             }
         }
         Frequency::Yearly => {
             let month = rule.get_by_month().first().copied().unwrap_or(1);
             let day = rule.get_by_month_day().first().copied().unwrap_or(1);
-            match lang {
-                Language::De => format!("jährlich {day}.{month}. {hm}"),
-                Language::En => format!(
-                    "yearly {day} {} {hm}",
+            match (interval, lang) {
+                (1, Language::De) => format!("jährlich {day}.{month}. {hm}"),
+                (1, Language::En) => {
+                    format!("yearly {day} {} {hm}", month_name_short(month as u32, lang))
+                }
+                (n, Language::De) => format!("alle {n} Jahre, {day}.{month}. {hm}"),
+                (n, Language::En) => format!(
+                    "every {n} years on {day} {} {hm}",
                     month_name_short(month as u32, lang)
                 ),
             }

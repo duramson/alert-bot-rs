@@ -113,7 +113,9 @@ pub fn match_named_day(token: &str) -> Option<NamedDay> {
 // Compact suffixes: single char, CASE-SENSITIVE.
 // ---------------------------------------------------------------------------
 
-/// `m` ≠ `M`. `y` and `j` are not valid compact suffixes — use `Y`.
+/// `m` ≠ `M` (minute vs month) — that collision is the whole reason suffixes
+/// are case-sensitive. Year has no such clash, so both `Y` and `y` are
+/// accepted (`1y` reads naturally, cf. "22yo"). `j` is still not a suffix.
 pub fn compact_unit(c: char) -> Option<TimeUnit> {
     match c {
         's' => Some(TimeUnit::Second),
@@ -122,7 +124,7 @@ pub fn compact_unit(c: char) -> Option<TimeUnit> {
         'd' => Some(TimeUnit::Day),
         'w' => Some(TimeUnit::Week),
         'M' => Some(TimeUnit::Month),
-        'Y' => Some(TimeUnit::Year),
+        'Y' | 'y' => Some(TimeUnit::Year),
         _ => None,
     }
 }
@@ -227,7 +229,8 @@ mod tests {
         assert_eq!(compact_unit('h'), Some(TimeUnit::Hour));
         assert_eq!(compact_unit('H'), None);
         assert_eq!(compact_unit('Y'), Some(TimeUnit::Year));
-        assert_eq!(compact_unit('y'), None);
+        // Year is the one case-insensitive suffix — no minute/month-style clash.
+        assert_eq!(compact_unit('y'), Some(TimeUnit::Year));
         assert_eq!(compact_unit('j'), None);
         assert_eq!(compact_unit('x'), None);
     }

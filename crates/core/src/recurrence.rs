@@ -162,7 +162,20 @@ impl Schedule {
         day: u8,
         time: NaiveTime,
     ) -> Result<Self, ScheduleError> {
+        Self::monthly_every(dtstart, tz, 1, day, time)
+    }
+
+    /// Every `interval` months on a specific day-of-month (`*3M` → INTERVAL=3).
+    /// Same strict day semantics as [`Self::monthly`].
+    pub fn monthly_every(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        interval: u16,
+        day: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
         let rule = RRule::new(Frequency::Monthly)
+            .interval(interval)
             .by_month_day(vec![day as i8])
             .by_hour(vec![time.hour() as u8])
             .by_minute(vec![time.minute() as u8]);
@@ -201,9 +214,23 @@ impl Schedule {
         day: u8,
         time: NaiveTime,
     ) -> Result<Self, ScheduleError> {
+        Self::yearly_every(dtstart, tz, 1, month, day, time)
+    }
+
+    /// Every `interval` years on a fixed month + day (`*2Y` → INTERVAL=2).
+    /// Same strict date semantics as [`Self::yearly`].
+    pub fn yearly_every(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        interval: u16,
+        month: u8,
+        day: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
         let chrono_month = chrono::Month::try_from(month)
             .map_err(|_| ScheduleError::Invalid(format!("invalid month {month}")))?;
         let rule = RRule::new(Frequency::Yearly)
+            .interval(interval)
             .by_month(&[chrono_month])
             .by_month_day(vec![day as i8])
             .by_hour(vec![time.hour() as u8])
@@ -485,6 +512,32 @@ mod tests {
         assert_eq!(
             s.next_after(local(2026, 12, 24, 10, 0)),
             Some(local(2027, 12, 24, 9, 0))
+        );
+    }
+
+    #[test]
+    fn yearly_every_two_years_emits_interval() {
+        let s = Schedule::yearly_every(local(2026, 5, 8, 9, 0), berlin(), 2, 5, 8, t(9, 0)).unwrap();
+        let rule = s.rrule.as_deref().unwrap();
+        assert!(rule.contains("FREQ=YEARLY"));
+        assert!(rule.contains("INTERVAL=2"));
+        // 2026 → 2028, not 2027
+        assert_eq!(
+            s.next_after(local(2026, 5, 8, 10, 0)),
+            Some(local(2028, 5, 8, 9, 0))
+        );
+    }
+
+    #[test]
+    fn monthly_every_three_months_emits_interval() {
+        let s = Schedule::monthly_every(local(2026, 5, 8, 9, 0), berlin(), 3, 8, t(9, 0)).unwrap();
+        let rule = s.rrule.as_deref().unwrap();
+        assert!(rule.contains("FREQ=MONTHLY"));
+        assert!(rule.contains("INTERVAL=3"));
+        // May 8 → Aug 8, skipping Jun/Jul
+        assert_eq!(
+            s.next_after(local(2026, 5, 8, 10, 0)),
+            Some(local(2026, 8, 8, 9, 0))
         );
     }
 
