@@ -66,6 +66,9 @@ serde = { version = "1", features = ["derive"] }
 dotenvy = "0.15"
 url = "2"
 
+# Benchmarking (dev-only)
+criterion = "0.5"
+
 # Internal
 parser = { path = "crates/parser" }
 botcore = { path = "crates/core", package = "alert-bot-core" }

@@ -12,3 +12,10 @@ chrono.workspace = true
 chrono-tz.workspace = true
 strsim.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "parse"
+harness = false

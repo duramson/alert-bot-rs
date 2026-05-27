@@ -81,7 +81,15 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
     // find the user is non-fatal — fall back to German (the bot's default).
     let lang = match store.get_user(alert.user_id).await {
         Ok(Some(u)) => u.language,
-        _ => Language::De,
+        // User row gone (e.g. /start never completed) — non-fatal, use the default.
+        Ok(None) => Language::De,
+        // A DB error here shouldn't block delivery, but it's not the same as a
+        // missing user — surface it so a flapping connection doesn't hide behind
+        // the German fallback.
+        Err(e) => {
+            warn!(user_id = alert.user_id, error = %e, "user lookup failed during delivery; defaulting language to German");
+            Language::De
+        }
     };
 
     let now = Utc::now();
