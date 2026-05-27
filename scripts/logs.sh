@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-LXC_HOST="${LXC_HOST:-root@10.0.70.240}"
+LXC_HOST="${LXC_HOST:-root@10.0.70.244}"
 SERVICE="${1:-alert-bot}"
 TAIL_LINES="${2:-100}"
 

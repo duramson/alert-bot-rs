@@ -378,7 +378,7 @@ deploy or re-applying after a Cloudflare config change.
 ./scripts/logs.sh alertbot-backup 50    # last backup run
 ```
 
-Requires `LXC_HOST` (default `root@10.0.70.240`) exported in your shell.
+Requires `LXC_HOST` (default `root@10.0.70.244`) exported in your shell.
 
 ### Rollback
 
