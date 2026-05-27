@@ -12,10 +12,7 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
 
-use botcore::{
-    schedule_from_legacy, Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule,
-    User,
-};
+use botcore::{Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule, User};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -135,7 +132,7 @@ impl PgStore {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
-                      recurrence, dtstart, rrule, tz,
+                      dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             "#,
         )
@@ -158,7 +155,7 @@ impl PgStore {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
-                   recurrence, dtstart, rrule, tz,
+                   dtstart, rrule, tz,
                    state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             FROM alerts WHERE id = $1
             "#,
@@ -176,7 +173,7 @@ impl PgStore {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
-                   recurrence, dtstart, rrule, tz,
+                   dtstart, rrule, tz,
                    state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             FROM alerts
             WHERE chat_id = $1 AND state IN ('pending', 'claimed')
@@ -233,7 +230,7 @@ impl PgStore {
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
-                      recurrence, dtstart, rrule, tz,
+                      dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
             "#,
         )
@@ -409,21 +406,10 @@ fn row_to_alert(row: PgRow) -> Result<Alert> {
         .parse()
         .map_err(|_| StorageError::InvalidTimezone(tz_name.clone()))?;
     let rrule_str: Option<String> = row.try_get("rrule")?;
-    let legacy_recurrence: Option<String> = row.try_get("recurrence")?;
 
-    // Schedule construction:
-    //   1. Prefer the new `rrule` column if present.
-    //   2. Otherwise fall back to the legacy `recurrence` column and translate
-    //      on read; the next write will replace it with the new form.
-    //   3. If both are absent, it's a one-shot.
-    let schedule = match (rrule_str.as_deref(), legacy_recurrence.as_deref()) {
-        (Some(s), _) => Schedule::from_db(dtstart, tz, Some(s))
-            .map_err(|e| StorageError::InvalidEnum(e.to_string()))?,
-        (None, Some(legacy)) => schedule_from_legacy(legacy, dtstart, tz)
-            .map_err(|e| StorageError::InvalidEnum(e.to_string()))?
-            .unwrap_or_else(|| Schedule::one_shot(dtstart, tz)),
-        (None, None) => Schedule::one_shot(dtstart, tz),
-    };
+    // A populated `rrule` means recurring; absent (or empty) means one-shot.
+    let schedule = Schedule::from_db(dtstart, tz, rrule_str.as_deref())
+        .map_err(|e| StorageError::InvalidEnum(e.to_string()))?;
 
     Ok(Alert {
         id: row.try_get("id")?,

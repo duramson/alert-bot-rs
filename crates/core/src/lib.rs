@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod recurrence;
 
-pub use recurrence::{schedule_from_legacy, Schedule, ScheduleError};
+pub use recurrence::{Schedule, ScheduleError};
 
 /// Telegram chat type as reported by the Bot API. We persist the raw string
 /// so that future Telegram additions don't require a migration.
