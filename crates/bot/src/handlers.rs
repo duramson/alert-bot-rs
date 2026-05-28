@@ -450,6 +450,11 @@ async fn handle_snooze_callback(
     };
     let created = store.create_alert(new).await?;
 
+    // Strip the buttons off the originally-delivered message so the user
+    // can't double-tap +5m and stack snoozes. The freshly-created one-shot
+    // will get its own button row when it fires.
+    clear_inline_buttons(bot, query).await;
+
     let when = render::format_local_compact(created.fire_at, user.timezone, user.language);
     let chat_id_for_reply = query
         .message
@@ -475,6 +480,9 @@ async fn handle_stop_series_callback(
     let requester = query.from.id.0 as i64;
     let ok = store.cancel_alert(alert_id, requester).await?;
     if ok {
+        // Strip buttons first — the series is gone, so the +5m / Serie beenden
+        // controls on this delivered message would all no-op or surprise the user.
+        clear_inline_buttons(bot, query).await;
         if let Some(msg) = query.message.as_ref() {
             bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
                 .await?;
@@ -489,6 +497,20 @@ async fn handle_stop_series_callback(
             .await?;
     }
     Ok(())
+}
+
+/// Remove the inline keyboard from the message that originated this callback.
+/// Best-effort: silently ignores edit failures (most common one being a
+/// message older than Telegram's 48h edit window).
+async fn clear_inline_buttons(bot: &Bot, query: &CallbackQuery) {
+    if let Some(msg) = query.message.as_ref() {
+        let empty: InlineKeyboardMarkup =
+            InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
+        bot.edit_message_reply_markup(msg.chat().id, msg.id())
+            .reply_markup(empty)
+            .await
+            .ok();
+    }
 }
 
 // ---------------------------------------------------------------------------
