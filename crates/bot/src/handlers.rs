@@ -15,12 +15,19 @@ use parser::ParseContext;
 use storage::PgStore;
 
 use crate::commands::Command;
+use crate::limits::{self, CommandRateLimiter};
 use crate::messages as m;
 use crate::render;
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>) -> HandlerResult {
+pub async fn dispatch(
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    store: Arc<PgStore>,
+    limiter: Arc<CommandRateLimiter>,
+) -> HandlerResult {
     let user_id = match msg.from.as_ref() {
         Some(u) => u.id.0 as i64,
         None => return Ok(()), // anonymous channel posts: ignore
@@ -28,6 +35,15 @@ pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>)
     let detected_lang = Language::from_telegram_code(
         msg.from.as_ref().and_then(|u| u.language_code.as_deref()),
     );
+
+    // Rate-limit before touching the DB. A spammer who blew past their
+    // per-minute budget shouldn't get free upsert_user calls.
+    if !limiter.check(user_id) {
+        bot.send_message(msg.chat.id, m::rate_limited(detected_lang))
+            .await
+            .ok();
+        return Ok(());
+    }
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -104,6 +120,35 @@ async fn create_alert(
             return Ok(());
         }
     };
+
+    // Anti-spam guards. Order matters: text-length is the cheapest check, do
+    // it first so we don't even count rows for an obvious junk payload.
+    if parsed.text.chars().count() > limits::MAX_TEXT_LEN {
+        bot.send_message(
+            msg.chat.id,
+            m::text_too_long(user.language, limits::MAX_TEXT_LEN),
+        )
+        .await?;
+        return Ok(());
+    }
+    let user_count = store.count_active_for_user(user.telegram_id).await?;
+    if user_count >= limits::MAX_ALERTS_PER_USER {
+        bot.send_message(
+            msg.chat.id,
+            m::user_quota_exceeded(user.language, user_count, limits::MAX_ALERTS_PER_USER),
+        )
+        .await?;
+        return Ok(());
+    }
+    let chat_count = store.count_active_for_chat(msg.chat.id.0).await?;
+    if chat_count >= limits::MAX_ALERTS_PER_CHAT {
+        bot.send_message(
+            msg.chat.id,
+            m::chat_quota_exceeded(user.language, chat_count, limits::MAX_ALERTS_PER_CHAT),
+        )
+        .await?;
+        return Ok(());
+    }
 
     let chat_type = chat_type_from_msg(msg);
     let new = NewAlert {
@@ -351,9 +396,22 @@ pub async fn callback_dispatch(
     bot: Bot,
     query: CallbackQuery,
     store: Arc<PgStore>,
+    limiter: Arc<CommandRateLimiter>,
 ) -> HandlerResult {
     let user_id = query.from.id.0 as i64;
     let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
+
+    // Callbacks count against the same per-user budget as commands —
+    // otherwise a scripted client could spam +5m on every button forever.
+    if !limiter.check(user_id) {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::rate_limited(detected_lang))
+            .show_alert(false)
+            .await
+            .ok();
+        return Ok(());
+    }
+
     let user = store.upsert_user(user_id, detected_lang).await?;
 
     let data = query.data.as_deref().unwrap_or("");
@@ -437,6 +495,34 @@ async fn handle_snooze_callback(
             .await?;
         return Ok(());
     };
+
+    // Snooze creates a new alert, so it counts against both quotas the same
+    // way as a fresh /alert command would. The errors get rendered as a
+    // callback toast (no separate chat message) since the user is mid-tap.
+    let user_count = store.count_active_for_user(user.telegram_id).await?;
+    if user_count >= limits::MAX_ALERTS_PER_USER {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::user_quota_exceeded(
+                user.language,
+                user_count,
+                limits::MAX_ALERTS_PER_USER,
+            ))
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+    let chat_count = store.count_active_for_chat(original.chat_id).await?;
+    if chat_count >= limits::MAX_ALERTS_PER_CHAT {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::chat_quota_exceeded(
+                user.language,
+                chat_count,
+                limits::MAX_ALERTS_PER_CHAT,
+            ))
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
 
     let fire_at = Utc::now() + chrono::Duration::seconds(offset_secs);
     let new = NewAlert {

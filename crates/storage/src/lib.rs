@@ -292,6 +292,37 @@ impl PgStore {
         Ok(res.rows_affected())
     }
 
+    /// Count of active (pending or claimed) alerts for one user. Used by the
+    /// quota check in `/alert` and `/galert`. Hits the partial index
+    /// `alerts_user_active_idx` so this stays sub-ms even at 10k+ users.
+    pub async fn count_active_for_user(&self, user_id: i64) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT count(*) FROM alerts
+            WHERE user_id = $1 AND state IN ('pending', 'claimed')
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Count of active alerts pinned to one chat (DM, group, or supergroup).
+    /// Uses the existing partial index `alerts_chat_idx`.
+    pub async fn count_active_for_chat(&self, chat_id: i64) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT count(*) FROM alerts
+            WHERE chat_id = $1 AND state IN ('pending', 'claimed')
+            "#,
+        )
+        .bind(chat_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
     /// Earliest pending fire time, used by the worker to compute its next
     /// wake-up timer. `None` means no pending alerts at all.
     pub async fn next_pending_fire_at(&self) -> Result<Option<DateTime<Utc>>> {

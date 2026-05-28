@@ -19,6 +19,7 @@ axum.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 dotenvy.workspace = true
+governor.workspace = true
 reqwest.workspace = true
 rrule.workspace = true
 sqlx.workspace = true

@@ -17,6 +17,7 @@ use storage::PgStore;
 mod admin;
 mod commands;
 mod handlers;
+mod limits;
 mod messages;
 mod render;
 mod stats;
@@ -24,6 +25,7 @@ mod worker;
 
 use admin::AdminNotifier;
 use commands::Command;
+use limits::CommandRateLimiter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -74,6 +76,10 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Single shared rate limiter — DashMap-backed, cheap to clone (it's an Arc
+    // internally). One instance per process; restart resets the window.
+    let rate_limiter = Arc::new(CommandRateLimiter::new());
+
     let handler = dptree::entry()
         // Telegram retries webhook deliveries on timeout — drop duplicates by
         // update_id. Errors are logged and we fall through (better to risk a
@@ -99,7 +105,7 @@ async fn main() -> Result<()> {
     // We install our own handler below that covers both SIGTERM and SIGINT
     // and feeds the dispatcher's ShutdownToken on either.
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
-        .dependencies(dptree::deps![store.clone()])
+        .dependencies(dptree::deps![store.clone(), rate_limiter.clone()])
         .build();
 
     spawn_signal_handler(

@@ -66,6 +66,9 @@ serde = { version = "1", features = ["derive"] }
 dotenvy = "0.15"
 url = "2"
 
+# Rate limiting (in-memory token bucket per Telegram user_id).
+governor = "0.7"
+
 # Benchmarking (dev-only)
 criterion = "0.5"
 

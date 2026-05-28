@@ -262,6 +262,47 @@ pub fn series_stopped(lang: Language, id: i64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Anti-spam / quota errors. Kept short so they also fit Telegram's ~200-char
+// callback-query toast limit.
+// ---------------------------------------------------------------------------
+
+pub fn rate_limited(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Zu viele Befehle in kurzer Zeit. Probier's gleich nochmal.",
+        Language::En => "Too many commands too fast. Try again in a moment.",
+    }
+}
+
+pub fn user_quota_exceeded(lang: Language, current: i64, max: i64) -> String {
+    match lang {
+        Language::De => format!(
+            "Du hast {current} aktive Reminder (Limit {max}). Lösch ein paar mit /cancel <id>, dann geht's weiter."
+        ),
+        Language::En => format!(
+            "You have {current} active reminders (limit {max}). Cancel some with /cancel <id> to make room."
+        ),
+    }
+}
+
+pub fn chat_quota_exceeded(lang: Language, current: i64, max: i64) -> String {
+    match lang {
+        Language::De => format!(
+            "Dieser Chat hat schon {current} aktive Reminder (Limit {max}). /list zeigt sie."
+        ),
+        Language::En => format!(
+            "This chat already has {current} active reminders (limit {max}). /list shows them."
+        ),
+    }
+}
+
+pub fn text_too_long(lang: Language, max: usize) -> String {
+    match lang {
+        Language::De => format!("Reminder-Text ist zu lang (max {max} Zeichen)."),
+        Language::En => format!("Reminder text is too long (max {max} chars)."),
+    }
+}
+
 /// Prepended to a reminder when the worker delivered it noticeably late
 /// (typically because the bot was offline). `delay_human` is something like
 /// "5min", "2h", "1d 3h".
