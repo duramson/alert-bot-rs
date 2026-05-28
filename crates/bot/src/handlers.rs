@@ -10,7 +10,7 @@ use teloxide::types::{
     PublicChatKind, Recipient,
 };
 
-use botcore::{AlertScope, ChatType, Language, NewAlert};
+use botcore::{AlertScope, ChatType, Language, NewAlert, Schedule};
 use parser::ParseContext;
 use storage::PgStore;
 
@@ -160,6 +160,33 @@ fn action_keyboard(lang: Language, id: i64) -> InlineKeyboardMarkup {
         m::button_cancel(lang),
         format!("cancel:{id}"),
     )]])
+}
+
+/// Inline keyboard attached to each *delivered* reminder. Always three snooze
+/// buttons; an extra ✗ Serie beenden appears only for recurring alerts, so
+/// users can kill the whole series without typing `/cancel`.
+pub fn delivery_keyboard(lang: Language, alert_id: i64, is_recurring: bool) -> InlineKeyboardMarkup {
+    let mut row = vec![
+        InlineKeyboardButton::callback(
+            m::button_snooze_5m(lang),
+            format!("snooze:300:{alert_id}"),
+        ),
+        InlineKeyboardButton::callback(
+            m::button_snooze_15m(lang),
+            format!("snooze:900:{alert_id}"),
+        ),
+        InlineKeyboardButton::callback(
+            m::button_snooze_1h(lang),
+            format!("snooze:3600:{alert_id}"),
+        ),
+    ];
+    if is_recurring {
+        row.push(InlineKeyboardButton::callback(
+            m::button_stop_series(lang),
+            format!("stop_series:{alert_id}"),
+        ));
+    }
+    InlineKeyboardMarkup::new(vec![row])
 }
 
 async fn galert(
@@ -330,20 +357,32 @@ pub async fn callback_dispatch(
     let user = store.upsert_user(user_id, detected_lang).await?;
 
     let data = query.data.as_deref().unwrap_or("");
-    let Some((kind, id_str)) = data.split_once(':') else {
-        bot.answer_callback_query(query.id.clone()).await?;
-        return Ok(());
-    };
-    let alert_id: i64 = match id_str.parse() {
-        Ok(i) => i,
-        Err(_) => {
-            bot.answer_callback_query(query.id.clone()).await?;
-            return Ok(());
+    let parts: Vec<&str> = data.split(':').collect();
+    match parts.as_slice() {
+        ["cancel", id_str] => {
+            if let Ok(id) = id_str.parse::<i64>() {
+                handle_cancel_callback(&bot, &store, &query, user.language, id).await?;
+            } else {
+                bot.answer_callback_query(query.id.clone()).await?;
+            }
         }
-    };
-
-    match kind {
-        "cancel" => handle_cancel_callback(&bot, &store, &query, user.language, alert_id).await?,
+        ["snooze", offset_str, id_str] => {
+            match (offset_str.parse::<i64>(), id_str.parse::<i64>()) {
+                (Ok(offset), Ok(id)) => {
+                    handle_snooze_callback(&bot, &store, &query, &user, offset, id).await?;
+                }
+                _ => {
+                    bot.answer_callback_query(query.id.clone()).await?;
+                }
+            }
+        }
+        ["stop_series", id_str] => {
+            if let Ok(id) = id_str.parse::<i64>() {
+                handle_stop_series_callback(&bot, &store, &query, user.language, id).await?;
+            } else {
+                bot.answer_callback_query(query.id.clone()).await?;
+            }
+        }
         _ => {
             bot.answer_callback_query(query.id.clone()).await?;
         }
@@ -366,6 +405,79 @@ async fn handle_cancel_callback(
             bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
                 .await
                 .ok();
+        }
+        bot.answer_callback_query(query.id.clone())
+            .text(m::callback_cancelled(lang))
+            .await?;
+    } else {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::cancel_not_allowed(lang))
+            .show_alert(true)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Snooze: build a *new* one-shot alert with the same text in the same chat,
+/// fire_at = now + offset. The original alert is never mutated — that's the
+/// key design choice so recurring alerts keep their schedule untouched.
+/// The new alert is owned by whoever tapped (so they can cancel it).
+async fn handle_snooze_callback(
+    bot: &Bot,
+    store: &PgStore,
+    query: &CallbackQuery,
+    user: &botcore::User,
+    offset_secs: i64,
+    alert_id: i64,
+) -> HandlerResult {
+    let Some(original) = store.get_alert(alert_id).await? else {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::snooze_gone(user.language))
+            .show_alert(false)
+            .await?;
+        return Ok(());
+    };
+
+    let fire_at = Utc::now() + chrono::Duration::seconds(offset_secs);
+    let new = NewAlert {
+        user_id: user.telegram_id,
+        chat_id: original.chat_id,
+        chat_type: original.chat_type.clone(),
+        scope: AlertScope::Private,
+        text: original.text.clone(),
+        fire_at,
+        schedule: Schedule::one_shot(fire_at, original.schedule.tz),
+    };
+    let created = store.create_alert(new).await?;
+
+    let when = render::format_local_compact(created.fire_at, user.timezone, user.language);
+    let chat_id_for_reply = query
+        .message
+        .as_ref()
+        .map(|m| m.chat().id)
+        .unwrap_or(ChatId(original.chat_id));
+    bot.send_message(chat_id_for_reply, m::snooze_confirmation(user.language, &when))
+        .await?;
+    bot.answer_callback_query(query.id.clone()).await?;
+    Ok(())
+}
+
+/// Stop the recurring series: reuses the existing `cancel_alert` flow (which
+/// enforces `Alert::can_edit`). For shared galert anyone may stop; for private
+/// alerts only the creator. Falls back to a `not allowed` toast otherwise.
+async fn handle_stop_series_callback(
+    bot: &Bot,
+    store: &PgStore,
+    query: &CallbackQuery,
+    lang: Language,
+    alert_id: i64,
+) -> HandlerResult {
+    let requester = query.from.id.0 as i64;
+    let ok = store.cancel_alert(alert_id, requester).await?;
+    if ok {
+        if let Some(msg) = query.message.as_ref() {
+            bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
+                .await?;
         }
         bot.answer_callback_query(query.id.clone())
             .text(m::callback_cancelled(lang))
@@ -424,5 +536,37 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use teloxide::types::InlineKeyboardButtonKind;
+
+    fn callback_data(btn: &InlineKeyboardButton) -> &str {
+        match &btn.kind {
+            InlineKeyboardButtonKind::CallbackData(s) => s,
+            _ => panic!("expected callback button"),
+        }
+    }
+
+    #[test]
+    fn delivery_keyboard_oneshot_has_three_snooze_buttons_only() {
+        let kb = delivery_keyboard(Language::De, 42, false);
+        assert_eq!(kb.inline_keyboard.len(), 1, "single row expected");
+        let row = &kb.inline_keyboard[0];
+        assert_eq!(row.len(), 3, "three snooze buttons, no stop_series");
+        assert_eq!(callback_data(&row[0]), "snooze:300:42");
+        assert_eq!(callback_data(&row[1]), "snooze:900:42");
+        assert_eq!(callback_data(&row[2]), "snooze:3600:42");
+    }
+
+    #[test]
+    fn delivery_keyboard_recurring_adds_stop_series_button() {
+        let kb = delivery_keyboard(Language::En, 7, true);
+        let row = &kb.inline_keyboard[0];
+        assert_eq!(row.len(), 4);
+        assert_eq!(callback_data(&row[3]), "stop_series:7");
+    }
 }
 

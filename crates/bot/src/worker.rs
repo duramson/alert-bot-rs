@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 use botcore::{Alert, Language};
 use storage::PgStore;
 
+use crate::handlers;
 use crate::messages as m;
 use crate::render;
 
@@ -101,7 +102,13 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         alert.text.clone()
     };
 
-    let send = bot.send_message(ChatId(alert.chat_id), &body).send().await;
+    let keyboard =
+        handlers::delivery_keyboard(lang, alert.id, alert.schedule.is_recurring());
+    let send = bot
+        .send_message(ChatId(alert.chat_id), &body)
+        .reply_markup(keyboard)
+        .send()
+        .await;
 
     match send {
         Ok(_) => {

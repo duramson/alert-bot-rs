@@ -218,6 +218,50 @@ pub fn button_cancel(lang: Language) -> &'static str {
     }
 }
 
+/// Snooze labels on delivered-reminder messages. Same in both languages —
+/// the suffix notation is universal and stays compact on mobile.
+pub fn button_snooze_5m(_lang: Language) -> &'static str {
+    "+5m"
+}
+
+pub fn button_snooze_15m(_lang: Language) -> &'static str {
+    "+15m"
+}
+
+pub fn button_snooze_1h(_lang: Language) -> &'static str {
+    "+1h"
+}
+
+pub fn button_stop_series(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "✗ Serie beenden",
+        Language::En => "✗ Stop series",
+    }
+}
+
+/// Confirmation sent after a snooze tap. `when_compact` is the resolved fire
+/// time rendered in the clicker's timezone.
+pub fn snooze_confirmation(lang: Language, when_compact: &str) -> String {
+    match lang {
+        Language::De => format!("💤 verschoben · {when_compact}"),
+        Language::En => format!("💤 snoozed · {when_compact}"),
+    }
+}
+
+pub fn snooze_gone(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Konnte nicht verschieben — Reminder existiert nicht mehr.",
+        Language::En => "Couldn't snooze — reminder is gone.",
+    }
+}
+
+pub fn series_stopped(lang: Language, id: i64) -> String {
+    match lang {
+        Language::De => format!("✗ Serie #{id} beendet."),
+        Language::En => format!("✗ Series #{id} stopped."),
+    }
+}
+
 /// Prepended to a reminder when the worker delivered it noticeably late
 /// (typically because the bot was offline). `delay_human` is something like
 /// "5min", "2h", "1d 3h".
