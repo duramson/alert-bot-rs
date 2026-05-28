@@ -25,10 +25,13 @@ pub const MAX_ALERTS_PER_USER: i64 = 100;
 /// Defends against "bot added to hostile group, someone spams /galert".
 pub const MAX_ALERTS_PER_CHAT: i64 = 50;
 
-/// Commands accepted per Telegram user per minute. Bucket fills at the same
-/// rate so a user can spend the whole budget at once, then trickle at one
-/// command every 3s. 20/min is ~7× a power user's typical pace.
-const COMMANDS_PER_MINUTE: u32 = 20;
+/// Commands accepted per Telegram user per minute. Bucket starts full so a
+/// user can send 6 commands instantly (e.g. setting up several reminders
+/// in one sitting), then trickles at one command every 10s.
+///
+/// Real-world pace is 1-3/min in any normal session. 6/min has a small
+/// headroom for bulk-setup bursts; a spammer hits the wall immediately.
+const COMMANDS_PER_MINUTE: u32 = 6;
 
 pub type UserId = i64;
 
@@ -70,8 +73,8 @@ mod tests {
     #[test]
     fn rate_limiter_allows_initial_burst() {
         let l = CommandRateLimiter::new();
-        // 20/min quota → up to 20 should pass immediately.
-        for _ in 0..20 {
+        // Bucket starts full at COMMANDS_PER_MINUTE — that many in a row pass.
+        for _ in 0..COMMANDS_PER_MINUTE {
             assert!(l.check(42), "burst within quota");
         }
     }
