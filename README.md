@@ -90,21 +90,17 @@ This is how the live instance runs. cloudflared lives in its own LXC and
 fronts multiple services on the same Proxmox host; the alert-bot LXC just
 exposes `:8080` on the internal Proxmox bridge so cloudflared can reach it.
 
-```
-Telegram  ──HTTPS──►  Cloudflare edge  ──tunnel──►  cloudflared LXC
-                                                         │ HTTP :8080
-                                                         ▼
-                                                  ┌──────────────────┐
-                                                  │ alert-bot LXC    │
-                                                  │  ┌────────────┐  │
-                                                  │  │ alert-bot  │──┼──► postgres (local Unix socket)
-                                                  │  └────────────┘  │
-                                                  │   systemd-managed │
-                                                  └──────────────────┘
-                                                         │
-                                                       SFTP nightly
-                                                         ▼
-                                                  Netcup webhosting (off-site dumps)
+```mermaid
+flowchart LR
+    tg[Telegram] -- HTTPS --> cf[Cloudflare edge]
+    cf -- tunnel --> cfd[cloudflared LXC]
+    cfd -- "HTTP :8080" --> bot
+
+    subgraph lxc["alert-bot LXC · native systemd units, no Docker"]
+        bot[alert-bot] -- "local Unix socket" --> pg[(Postgres)]
+    end
+
+    pg -- "pg_dump nightly · SFTP" --> netcup[(Netcup · off-site dumps)]
 ```
 
 No Docker. Postgres and the bot binary both run as native systemd units on
@@ -347,6 +343,29 @@ and recreates objects, so running it on a non-empty DB is safe.
 Push to `master` → GitHub Actions builds → runner scp's straight to the
 LXC and restarts. The full pipeline is in
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
+
+```mermaid
+flowchart TD
+    trig["push to main / master<br/>(skips *.md, docs/, .gitignore)<br/>· or manual workflow_dispatch"] --> test
+
+    subgraph test["Job: test · ubuntu-22.04"]
+        t1[checkout + Rust toolchain] --> t2[restore crate cache]
+        t2 --> t3["cargo test --workspace"]
+    end
+
+    test -->|"needs: test"| deploy
+
+    subgraph deploy["Job: deploy · ubuntu-22.04 · glibc 2.35 pin"]
+        d1["cargo build --release + strip"] --> d2[install cloudflared]
+        d2 --> d3["write deploy SSH key<br/>secrets.LXC_SSH_KEY"]
+        d3 --> d4["sanity-check Cloudflare<br/>Access service token"]
+        d4 --> d5["scp binary to LXC<br/>over Cloudflare Access SSH"]
+        d5 --> d6["ssh: install + systemctl restart"]
+        d6 --> d7["tail journalctl ~20s"]
+    end
+
+    d6 -.->|deploys onto| host[("alert-bot LXC<br/>no public SSH port")]
+```
 
 1. **Test** — `cargo test --workspace`
 2. **Build & deploy** (one job, so the runner can scp the binary it just
