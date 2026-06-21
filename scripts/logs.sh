@@ -10,7 +10,9 @@
 
 set -euo pipefail
 
-LXC_HOST="${LXC_HOST:-root@10.0.70.244}"
+# Echte Ziel-IP steht in scripts/local.env (gitignored), nicht im Repo.
+[ -f "$(dirname "$0")/local.env" ] && . "$(dirname "$0")/local.env"
+LXC_HOST="${LXC_HOST:-root@<lxc-ip>}"
 SERVICE="${1:-alert-bot}"
 TAIL_LINES="${2:-100}"
 

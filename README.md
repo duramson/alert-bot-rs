@@ -13,7 +13,7 @@ You:   /alert do 14:00 Standup
 Bot:   ✓ #2 · Do 14.5.2026 14:00
        [✗ Löschen]
 
-You:   /alert 30.4.27 scheidung einreichen
+You:   /alert 30.4.27 ssl-zertifikat erneuern
 Bot:   ✓ #3 · Fr 30.4.2027 09:00
        [✗ Löschen]
 ```
@@ -378,7 +378,8 @@ deploy or re-applying after a Cloudflare config change.
 ./scripts/logs.sh alertbot-backup 50    # last backup run
 ```
 
-Requires `LXC_HOST` (default `root@10.0.70.244`) exported in your shell.
+Requires `LXC_HOST` exported in your shell, or set it once in
+`scripts/local.env` (gitignored). Defaults to a placeholder otherwise.
 
 ### Rollback
 

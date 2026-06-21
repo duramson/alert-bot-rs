@@ -8,3 +8,11 @@
 docker-compose.override.yml
 .gitnexus
 .claude/worktrees/
+
+# Lokale Entwickler-/Agent-Notizen — nicht im Repo
+AGENTS.md
+CLAUDE.md
+FINDINGS.md
+TODO.md
+scripts/local.env
+.claude/
