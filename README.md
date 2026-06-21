@@ -1,8 +1,16 @@
 # alert-bot-rs
 
+[![CI](https://github.com/duramson/alert-bot-rs/actions/workflows/deploy.yml/badge.svg)](https://github.com/duramson/alert-bot-rs/actions/workflows/deploy.yml)
+[![Rust](https://img.shields.io/badge/rust-1.86%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Try it on Telegram](https://img.shields.io/badge/Telegram-%40rust__alertbot-26A5E4?logo=telegram&logoColor=white)](https://t.me/rust_alertbot)
+
 A Telegram reminder bot in Rust. German and English natural language, fuzzy
 matching against typos, group reminders with per-user permissions, no LLM
 required — runs deterministically on your own hardware.
+
+The live instance runs on my Proxmox homelab as
+[**@rust_alertbot**](https://t.me/rust_alertbot) — message it `/start` to try it.
 
 ```
 You:   /alert 5m Kaffee fertig
@@ -339,6 +347,14 @@ systemctl start alert-bot
 and recreates objects, so running it on a non-empty DB is safe.
 
 ## Update workflow (CI/CD)
+
+**Why build in CI and not on the box?** The production LXC is deliberately
+tiny — 128 MB RAM, no Rust toolchain, no build dependencies. Compiling ~250
+crates there is a non-starter and would force the container to carry a whole
+build chain it never needs at runtime. So the ephemeral GitHub runner does the
+entire build, and only the stripped release binary (a few MB) is shipped to the
+LXC. The container stays minimal: it runs the binary and Postgres, nothing else
+— smaller footprint, smaller attack surface, faster restores.
 
 Push to `master` → GitHub Actions builds → runner scp's straight to the
 LXC and restarts. The full pipeline is in
