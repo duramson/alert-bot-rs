@@ -54,7 +54,7 @@ OLD_FILES=$(sshpass -p "${BACKUP_NETCUP_PASS}" \
     sftp -q -o StrictHostKeyChecking=accept-new \
          -b <(printf 'cd %s\nls -1\nbye\n' "${BACKUP_NETCUP_PATH}") \
          "${BACKUP_NETCUP_USER}@${BACKUP_NETCUP_HOST}" 2>/dev/null \
-  | grep -E '^alertbot-[0-9TZ]+\.sql\.gz$' || true)
+  | grep -E '^alertbot-[0-9TZ-]+\.sql\.gz$' || true)
 
 for f in $OLD_FILES; do
     # extract YYYY-MM-DDTHHMMSSZ from filename
