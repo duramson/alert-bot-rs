@@ -32,6 +32,11 @@ pub struct Schedule {
 pub enum ScheduleError {
     #[error("invalid rrule: {0}")]
     Invalid(String),
+    /// The requested interval doesn't fit RRULE's u16 INTERVAL field. Kept
+    /// distinct from `Invalid` so the parser can't confuse it with the
+    /// "interval too short" case (both would otherwise be free-text strings).
+    #[error("interval too large ({0}s exceeds the supported maximum)")]
+    IntervalTooLong(i64),
     #[error("rrule library error: {0}")]
     Library(#[from] rrule::RRuleError),
 }
@@ -112,12 +117,16 @@ impl Schedule {
                 "interval {seconds}s below minimum {MIN_INTERVAL_SECONDS}s"
             )));
         }
+        // RRULE's INTERVAL is a u16; a plain `as u16` would silently wrap
+        // (e.g. 66_270 min → 734), firing at a wildly wrong cadence with no
+        // error. Convert checked instead.
+        let fit = |n: i64| u16::try_from(n).map_err(|_| ScheduleError::IntervalTooLong(seconds));
         let rule = if seconds % 3600 == 0 {
-            RRule::new(Frequency::Hourly).interval((seconds / 3600) as u16)
+            RRule::new(Frequency::Hourly).interval(fit(seconds / 3600)?)
         } else if seconds % 60 == 0 {
-            RRule::new(Frequency::Minutely).interval((seconds / 60) as u16)
+            RRule::new(Frequency::Minutely).interval(fit(seconds / 60)?)
         } else {
-            RRule::new(Frequency::Secondly).interval(seconds as u16)
+            RRule::new(Frequency::Secondly).interval(fit(seconds)?)
         };
         Self::recurring(dtstart, tz, rule)
     }
@@ -333,6 +342,15 @@ mod tests {
         let dts = utc(2026, 5, 9, 10, 0);
         let err = Schedule::interval_seconds(dts, berlin(), 60).unwrap_err();
         assert!(matches!(err, ScheduleError::Invalid(_)));
+    }
+
+    #[test]
+    fn interval_above_u16_minutes_rejected_not_wrapped() {
+        // 46d30m = 3_976_200s → 66_270 min > u16::MAX (65_535). Must be a clean
+        // error, not a silent wrap to 734 min.
+        let dts = utc(2026, 5, 9, 10, 0);
+        let err = Schedule::interval_seconds(dts, berlin(), 3_976_200).unwrap_err();
+        assert!(matches!(err, ScheduleError::IntervalTooLong(3_976_200)));
     }
 
     // ---- Daily ----

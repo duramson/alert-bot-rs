@@ -117,6 +117,7 @@ impl From<ScheduleError> for ParseError {
             ScheduleError::Invalid(s) if s.starts_with("interval ") => {
                 ParseError::IntervalTooShort(MIN_INTERVAL_SECONDS)
             }
+            ScheduleError::IntervalTooLong(_) => ParseError::InvalidRecurrenceSpec,
             other => ParseError::Rrule(other.to_string()),
         }
     }
@@ -529,6 +530,18 @@ mod tests {
     #[test]
     fn rec_too_short() {
         assert_eq!(err("*5m wasser"), ParseError::IntervalTooShort(1800));
+    }
+
+    #[test]
+    fn rec_interval_days_overflow_rejected() {
+        // *70000d would wrap to 4464 days as a bare u16 cast. Reject cleanly.
+        assert_eq!(err("*70000d text"), ParseError::InvalidRecurrenceSpec);
+    }
+
+    #[test]
+    fn rec_interval_subday_overflow_rejected() {
+        // *46d30m = 66_270 minutes > u16::MAX → must not silently wrap.
+        assert_eq!(err("*46d30m text"), ParseError::InvalidRecurrenceSpec);
     }
 
     #[test]

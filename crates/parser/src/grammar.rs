@@ -757,7 +757,9 @@ fn try_recurring_relative(
     // intervals use an exact seconds rule anchored at now (so `*30m` stays
     // exactly 30 min apart even across a DST jump).
     let schedule = if total_secs % 86_400 == 0 {
-        let every_n_days = (total_secs / 86_400) as u16;
+        // Guard the u16 cast: `*70000d` would otherwise wrap to 4464 days.
+        let every_n_days = u16::try_from(total_secs / 86_400)
+            .map_err(|_| ParseError::InvalidRecurrenceSpec)?;
         let dtstart = next_dtstart_for_daily(every_n_days, creation_time, ctx);
         Schedule::daily_at(dtstart, ctx.tz, every_n_days, creation_time)?
     } else {
