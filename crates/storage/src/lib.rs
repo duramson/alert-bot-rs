@@ -240,40 +240,48 @@ impl PgStore {
         rows.into_iter().map(row_to_alert).collect()
     }
 
-    pub async fn mark_sent(&self, id: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE alerts SET state = 'sent', fired_at = now(), updated_at = now() WHERE id = $1",
+    /// Terminal/retry transitions after a delivery attempt guard on
+    /// `state = 'claimed'`: the worker only owns a row while it holds the claim.
+    /// If the reaper released a slow claim (or a second worker re-claimed, or the
+    /// user cancelled), the row is no longer ours and the write must be a no-op —
+    /// otherwise a late-completing send would resurrect a cancelled series or
+    /// clobber another worker's state. Return whether the transition applied.
+    pub async fn mark_sent(&self, id: i64) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE alerts SET state = 'sent', fired_at = now(), updated_at = now()
+             WHERE id = $1 AND state = 'claimed'",
         )
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
-    pub async fn mark_failed(&self, id: i64, error: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE alerts SET state = 'failed', last_error = $2, updated_at = now() WHERE id = $1",
+    pub async fn mark_failed(&self, id: i64, error: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE alerts SET state = 'failed', last_error = $2, updated_at = now()
+             WHERE id = $1 AND state = 'claimed'",
         )
         .bind(id)
         .bind(error)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     /// Re-queue: bumps `state` back to `pending` with a new `fire_at`.
     /// Used by retry logic when Telegram returns 429 (rate-limited).
     /// Deliberately keeps `attempts` — it's the same occurrence being retried.
-    pub async fn reschedule(&self, id: i64, fire_at: DateTime<Utc>) -> Result<()> {
-        sqlx::query(
+    pub async fn reschedule(&self, id: i64, fire_at: DateTime<Utc>) -> Result<bool> {
+        let res = sqlx::query(
             "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL, updated_at = now()
-             WHERE id = $1",
+             WHERE id = $1 AND state = 'claimed'",
         )
         .bind(id)
         .bind(fire_at)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     /// Successful delivery of a recurring alert: queue the next occurrence and
@@ -281,17 +289,17 @@ impl PgStore {
     /// over the alert's lifetime — without the reset a long-lived series would
     /// hit MAX_ATTEMPTS after enough successful deliveries and die on the first
     /// transient error (and eventually overflow the SMALLINT column).
-    pub async fn advance_to_next_occurrence(&self, id: i64, fire_at: DateTime<Utc>) -> Result<()> {
-        sqlx::query(
+    pub async fn advance_to_next_occurrence(&self, id: i64, fire_at: DateTime<Utc>) -> Result<bool> {
+        let res = sqlx::query(
             "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL,
                                attempts = 0, updated_at = now()
-             WHERE id = $1",
+             WHERE id = $1 AND state = 'claimed'",
         )
         .bind(id)
         .bind(fire_at)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     /// Reaper: rows stuck in `claimed` longer than the timeout were owned by

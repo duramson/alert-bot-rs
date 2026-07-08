@@ -160,15 +160,20 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
 /// to *now* (skipping any missed occurrences during downtime so we don't fire
 /// the past N intervals back-to-back) and reschedule. Otherwise mark sent.
 async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<()> {
-    if !alert.schedule.is_recurring() {
-        store.mark_sent(alert.id).await?;
-        return Ok(());
-    }
-
-    let now = Utc::now();
-    match alert.schedule.next_after(now) {
-        Some(next) => store.advance_to_next_occurrence(alert.id, next).await?,
-        None => store.mark_sent(alert.id).await?,
+    let applied = if !alert.schedule.is_recurring() {
+        store.mark_sent(alert.id).await?
+    } else {
+        let now = Utc::now();
+        match alert.schedule.next_after(now) {
+            Some(next) => store.advance_to_next_occurrence(alert.id, next).await?,
+            None => store.mark_sent(alert.id).await?,
+        }
+    };
+    if !applied {
+        // The state guard rejected the write: the reaper released our claim
+        // while the send was in flight and the row was re-claimed or cancelled
+        // meanwhile. Don't resurrect it — just note the wasted double-send.
+        warn!(id = alert.id, "delivered but claim was no longer ours; not finalising");
     }
     Ok(())
 }
