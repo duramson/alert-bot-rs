@@ -2,7 +2,7 @@
 Description=Daily alert-bot Postgres backup
 
 [Timer]
-OnCalendar=*-*-* 03:30:00
+OnCalendar=*-*-* 03:30:00 UTC
 Persistent=true
 RandomizedDelaySec=15min
 
