@@ -448,6 +448,31 @@ pub async fn callback_dispatch(
     Ok(())
 }
 
+/// Callback payloads are attacker-controlled: any client can send arbitrary
+/// `callback_data` (`cancel:123`, `snooze:300:123`, `stop_series:123`) with a
+/// guessed alert id — the ids are sequential BIGSERIAL, so trivial to enumerate.
+/// The `/cancel` *command* already checks the alert's chat matches the sender's
+/// (see `cancel`), but the callback paths did not — and `Alert::can_edit`
+/// returns `true` for any `Shared` alert. Only honour a callback if it comes
+/// from a message in the alert's own chat. `query.message == None` (very old
+/// messages, or forged queries with no origin) → reject.
+async fn callback_alert_in_origin_chat(
+    store: &PgStore,
+    query: &CallbackQuery,
+    alert_id: i64,
+) -> Result<Option<botcore::Alert>, storage::StorageError> {
+    let Some(alert) = store.get_alert(alert_id).await? else {
+        return Ok(None);
+    };
+    let Some(msg) = query.message.as_ref() else {
+        return Ok(None);
+    };
+    if msg.chat().id.0 != alert.chat_id {
+        return Ok(None);
+    }
+    Ok(Some(alert))
+}
+
 async fn handle_cancel_callback(
     bot: &Bot,
     store: &PgStore,
@@ -455,6 +480,16 @@ async fn handle_cancel_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
+    if callback_alert_in_origin_chat(store, query, alert_id)
+        .await?
+        .is_none()
+    {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::cancel_not_allowed(lang))
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
     let requester = query.from.id.0 as i64;
     let ok = store.cancel_alert(alert_id, requester).await?;
 
@@ -488,7 +523,7 @@ async fn handle_snooze_callback(
     offset_secs: i64,
     alert_id: i64,
 ) -> HandlerResult {
-    let Some(original) = store.get_alert(alert_id).await? else {
+    let Some(original) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::snooze_gone(user.language))
             .show_alert(false)
@@ -563,6 +598,16 @@ async fn handle_stop_series_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
+    if callback_alert_in_origin_chat(store, query, alert_id)
+        .await?
+        .is_none()
+    {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::cancel_not_allowed(lang))
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
     let requester = query.from.id.0 as i64;
     let ok = store.cancel_alert(alert_id, requester).await?;
     if ok {
