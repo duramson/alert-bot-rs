@@ -32,16 +32,23 @@ set -euo pipefail
 
 DATE=$(date -u +%Y-%m-%dT%H%M%SZ)
 REMOTE_FILE="${BACKUP_NETCUP_PATH}/alertbot-${DATE}.sql.gz"
+REMOTE_TMP="${REMOTE_FILE}.part"
 
 echo "[backup] dumping ${DB_NAME} → ${REMOTE_FILE}"
 
+# Stream to a .part name and only rename to the final name once the whole
+# pipeline succeeded. If pg_dump dies mid-stream, set -o pipefail aborts the
+# transfer, curl exits non-zero, and the post-transfer rename (the leading '-'
+# makes curl run it *after* a successful upload) never fires — so a truncated
+# dump can never masquerade as the latest good backup under the real name.
 pg_dump --clean --if-exists --no-owner --no-privileges "${DB_NAME}" \
   | gzip -9 \
   | curl --silent --show-error --fail \
          --user "${BACKUP_NETCUP_USER}:${BACKUP_NETCUP_PASS}" \
          --upload-file - \
          --ftp-create-dirs \
-         "sftp://${BACKUP_NETCUP_HOST}/${REMOTE_FILE}"
+         --quote "-rename ${REMOTE_TMP} ${REMOTE_FILE}" \
+         "sftp://${BACKUP_NETCUP_HOST}/${REMOTE_TMP}"
 
 echo "[backup] uploaded"
 
