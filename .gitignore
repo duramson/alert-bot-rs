@@ -13,6 +13,7 @@ docker-compose.override.yml
 AGENTS.md
 CLAUDE.md
 FINDINGS.md
+fable-findings.md
 TODO.md
 scripts/local.env
 .claude/
