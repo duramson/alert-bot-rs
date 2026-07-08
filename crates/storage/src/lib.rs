@@ -263,9 +263,28 @@ impl PgStore {
 
     /// Re-queue: bumps `state` back to `pending` with a new `fire_at`.
     /// Used by retry logic when Telegram returns 429 (rate-limited).
+    /// Deliberately keeps `attempts` — it's the same occurrence being retried.
     pub async fn reschedule(&self, id: i64, fire_at: DateTime<Utc>) -> Result<()> {
         sqlx::query(
             "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL, updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(fire_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Successful delivery of a recurring alert: queue the next occurrence and
+    /// reset the retry counter. `attempts` counts retries *per occurrence*, not
+    /// over the alert's lifetime — without the reset a long-lived series would
+    /// hit MAX_ATTEMPTS after enough successful deliveries and die on the first
+    /// transient error (and eventually overflow the SMALLINT column).
+    pub async fn advance_to_next_occurrence(&self, id: i64, fire_at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL,
+                               attempts = 0, updated_at = now()
              WHERE id = $1",
         )
         .bind(id)

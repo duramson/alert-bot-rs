@@ -167,7 +167,7 @@ async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<(
 
     let now = Utc::now();
     match alert.schedule.next_after(now) {
-        Some(next) => store.reschedule(alert.id, next).await?,
+        Some(next) => store.advance_to_next_occurrence(alert.id, next).await?,
         None => store.mark_sent(alert.id).await?,
     }
     Ok(())
