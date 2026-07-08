@@ -555,6 +555,54 @@ mod tests {
     }
 
     #[test]
+    fn rec_daily_short_with_time_override() {
+        // `*2d 11:00` fires every 2 days at 11:00 — the override wins over the
+        // 12:00 creation time and must not leak into the reminder text.
+        let r = p("*2d 11:00 Vitamin");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=DAILY"));
+        assert!(s.contains("INTERVAL=2"));
+        assert!(s.contains("BYHOUR=11"), "expected 11:00 override, got {s}");
+        assert_eq!(r.text, "Vitamin");
+    }
+
+    #[test]
+    fn rec_daily_keyword_with_time_override() {
+        // Keyword form `alle 2d 11:00` must behave identically to `*2d 11:00`.
+        let r = p("alle 2d 11:00 Vitamin");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=DAILY"));
+        assert!(s.contains("BYHOUR=11"), "expected 11:00 override, got {s}");
+        assert_eq!(r.text, "Vitamin");
+    }
+
+    #[test]
+    fn rec_monthly_short_with_time_override() {
+        let r = p("*3M 18:00 abrechnung");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=MONTHLY"));
+        assert!(s.contains("INTERVAL=3"));
+        assert!(s.contains("BYHOUR=18"), "expected 18:00 override, got {s}");
+        assert_eq!(r.text, "abrechnung");
+    }
+
+    #[test]
+    fn rec_yearly_short_with_time_override() {
+        let r = p("*1Y 9:00 tuv");
+        let s = rrule(&r);
+        assert!(s.contains("FREQ=YEARLY"));
+        assert!(s.contains("BYHOUR=9"), "expected 09:00 override, got {s}");
+        assert_eq!(r.text, "tuv");
+    }
+
+    #[test]
+    fn rec_subday_with_time_override_rejected() {
+        // `*30m 11:00` — an interval that also wants a fixed clock is
+        // contradictory, same as one-shot relative.
+        assert_eq!(err("*30m 11:00 wasser"), ParseError::SubDayRelWithOverride);
+    }
+
+    #[test]
     fn rec_weekly_single_day_long() {
         let r = p("jeden donnerstag 14:00 standup");
         let s = rrule(&r);
