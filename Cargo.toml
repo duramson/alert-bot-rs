@@ -70,7 +70,7 @@ url = "2"
 governor = "0.7"
 
 # Benchmarking (dev-only)
-criterion = "0.5"
+criterion = "0.8"
 
 # Internal
 parser = { path = "crates/parser" }
