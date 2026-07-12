@@ -23,7 +23,7 @@ teloxide = { version = "0.13", features = ["macros", "webhooks-axum"] }
 # Standalone HTTP server for the read-only /stats endpoint (Homepage widget).
 # Pinned to 0.7 so it unifies with the axum teloxide's webhooks-axum already
 # pulls — no duplicate axum/hyper in the tree.
-axum = { version = "0.7", default-features = false, features = ["tokio", "http1"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 
 # HTTP client we hand to teloxide explicitly so we can set tcp_keepalive and
 # tighter pool_idle_timeout — defaults let pooled HTTPS conns to api.telegram.org
