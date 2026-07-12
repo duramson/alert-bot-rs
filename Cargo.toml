@@ -18,7 +18,7 @@ license = "MIT OR Apache-2.0"
 tokio = { version = "1.41", features = ["full"] }
 
 # Telegram (pulls axum transitively via the `webhooks-axum` feature)
-teloxide = { version = "0.13", features = ["macros", "webhooks-axum"] }
+teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
 
 # Standalone HTTP server for the read-only /stats endpoint (Homepage widget).
 # Pinned to 0.7 so it unifies with the axum teloxide's webhooks-axum already
