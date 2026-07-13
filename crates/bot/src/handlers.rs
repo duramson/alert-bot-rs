@@ -678,7 +678,7 @@ fn chat_type_from_msg(msg: &Message) -> ChatType {
     match &msg.chat.kind {
         ChatKind::Private(_) => ChatType::Private,
         ChatKind::Public(public) => match public.kind {
-            PublicChatKind::Group(_) => ChatType::Group,
+            PublicChatKind::Group => ChatType::Group,
             PublicChatKind::Supergroup(_) => ChatType::Supergroup,
             PublicChatKind::Channel(_) => ChatType::Channel,
         },
