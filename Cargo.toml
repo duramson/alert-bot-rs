@@ -29,7 +29,7 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # tighter pool_idle_timeout — defaults let pooled HTTPS conns to api.telegram.org
 # go silently dead behind NAT, then the first SendMessage after idle hangs in
 # Connect-TimedOut and the user has to retry.
-reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["default-tls"] }
 
 # Database
 sqlx = { version = "0.8", default-features = false, features = [
