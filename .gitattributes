@@ -1,0 +1,3 @@
+# Normalize all text files to LF in the repo; check out with LF everywhere.
+# Avoids the autocrlf=true CRLF/LF churn on Windows working copies.
+* text=auto eol=lf
