@@ -1,0 +1,75 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    "config:recommended",
+    ":dependencyDashboard", // one tracking issue with everything Renovate sees
+    ":semanticCommits", // chore(deps): ... — keeps history clean & conventional
+    "helpers:pinGitHubActionDigests", // pin actions to SHAs (supply-chain hygiene)
+  ],
+
+  timezone: "Europe/Berlin",
+  // One batched run per week, off-hours. A predictable cadence beats a trickle.
+  schedule: ["before 6am on monday"],
+
+  // Keep noise bounded even in a busy week.
+  prConcurrentLimit: 5,
+  prHourlyLimit: 0, // no hourly throttle — the weekly schedule already gates it
+
+  // This is a DEPLOYED BINARY, not a library: we own the final artifact, so we
+  // stay current aggressively and lean on Cargo.lock + CI rather than keeping
+  // dependency ranges deliberately low (which is what a library like clap does).
+  rangeStrategy: "bump",
+
+  // Refresh Cargo.lock weekly even when no manifest range changes — pulls in
+  // patched transitive crates between our own commits. Auto-merged on green.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 6am on monday"],
+    automerge: true,
+  },
+
+  packageRules: [
+    // --- Cargo: minor + patch --------------------------------------------
+    // One grouped PR; auto-merges once CI is green. A merge to master triggers
+    // the LXC deploy, so this is continuous deployment: green CI -> prod.
+    {
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "cargo (minor & patch)",
+      automerge: true,
+    },
+
+    // --- Cargo: major ----------------------------------------------------
+    // Breaking bumps get their own PR and a human. Never auto-merged, never
+    // auto-deployed — these may need code changes (see reqwest below).
+    {
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["major"],
+      automerge: false,
+      labels: ["dependencies", "major"],
+    },
+
+    // --- reqwest: pinned to teloxide's line ------------------------------
+    // reqwest is a PUBLIC dependency of teloxide: Bot::with_client(_, reqwest::
+    // Client) exposes reqwest's types in teloxide's public API, and teloxide
+    // does NOT re-export reqwest. So our direct reqwest MUST stay on the same
+    // major teloxide resolves, or two reqwest versions land in the graph and
+    // build_http_client() stops type-checking against Bot::with_client.
+    // teloxide 0.17 -> reqwest 0.12. Lift this ceiling (or delete this rule)
+    // once teloxide releases against reqwest 0.13+.
+    {
+      matchManagers: ["cargo"],
+      matchPackageNames: ["reqwest"],
+      allowedVersions: "<0.13",
+    },
+
+    // --- GitHub Actions --------------------------------------------------
+    // Low-risk, grouped, auto-merged (digests kept fresh by the helper above).
+    {
+      matchManagers: ["github-actions"],
+      groupName: "github actions",
+      automerge: true,
+    },
+  ],
+}
