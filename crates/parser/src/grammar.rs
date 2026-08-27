@@ -6,7 +6,7 @@
 //! named day. Recurring reuses the relative scanner and adds weekday /
 //! day-of-month / month-day strategies.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
 
 use crate::keywords::{
     compact_unit, is_at_prefix, is_in_prefix, is_recurring_keyword, is_uhr, match_longform_unit,
@@ -721,7 +721,12 @@ fn try_recurring_relative(
     // at the wall-clock time the command was sent — `*30m`/`*2d`/`*1M`/`*1Y`
     // all fire at creation time, the calendar ones additionally keeping the
     // same day-of-month / day-of-year.
-    let creation_time = ctx.now_utc.with_timezone(&ctx.tz).time();
+    // Truncated to whole minutes: the seconds of the creation instant would
+    // otherwise be frozen into the RRULE (`BYSECOND=27`) and every future
+    // occurrence for years would fire at :27.
+    let now_local = ctx.now_utc.with_timezone(&ctx.tz);
+    let creation_time =
+        NaiveTime::from_hms_opt(now_local.hour(), now_local.minute(), 0).unwrap_or(DEFAULT_TIME);
     let time = override_time.unwrap_or(creation_time);
 
     // A spec maps onto exactly one RRULE FREQ family: yearly, monthly, or the
@@ -744,7 +749,7 @@ fn try_recurring_relative(
         let interval = u16::try_from(spec.years).map_err(|_| ParseError::InvalidRecurrenceSpec)?;
         let today = today_local(ctx);
         let (month, day) = (today.month() as u8, today.day() as u8);
-        let dtstart = next_dtstart_for_yearly(month, day, time, ctx);
+        let dtstart = next_dtstart_for_yearly(month, day, time, interval, ctx);
         let schedule = Schedule::yearly_every(dtstart, ctx.tz, interval, month, day, time)?;
         return Ok(Some((schedule, end_offset, None)));
     }
@@ -753,7 +758,7 @@ fn try_recurring_relative(
         let interval = u16::try_from(spec.months).map_err(|_| ParseError::InvalidRecurrenceSpec)?;
         let today = today_local(ctx);
         let day = today.day() as u8;
-        let dtstart = next_dtstart_for_monthly(day, time, ctx);
+        let dtstart = next_dtstart_for_monthly(day, time, interval, ctx);
         let schedule = Schedule::monthly_every(dtstart, ctx.tz, interval, day, time)?;
         return Ok(Some((schedule, end_offset, None)));
     }
@@ -844,7 +849,7 @@ fn try_recurring_day_of_month(
         let sch = Schedule::monthly_last_day(dtstart, ctx.tz, time)?;
         (sch, Some(ParseNote::MonthlyLastDay))
     } else {
-        let dtstart = next_dtstart_for_monthly(day, time, ctx);
+        let dtstart = next_dtstart_for_monthly(day, time, 1, ctx);
         let sch = Schedule::monthly(dtstart, ctx.tz, day, time)?;
         (sch, None)
     };
@@ -886,7 +891,7 @@ fn try_recurring_month_day(
         let sch = Schedule::yearly_last_day_of_month(dtstart, ctx.tz, month, time)?;
         (sch, Some(ParseNote::YearlyFeb29Fallback))
     } else {
-        let dtstart = next_dtstart_for_yearly(month, day, time, ctx);
+        let dtstart = next_dtstart_for_yearly(month, day, time, 1, ctx);
         let sch = Schedule::yearly(dtstart, ctx.tz, month, day, time)?;
         (sch, None)
     };
@@ -939,16 +944,21 @@ fn first_future_dtstart(
 }
 
 /// Iterator over `(year, month)` pairs starting at `(start_y, start_m)`,
-/// advancing one month at a time for `count` steps.
-fn month_iter(start_y: i32, start_m: u32, count: u32) -> impl Iterator<Item = (i32, u32)> {
-    (0..count).scan((start_y, start_m), |(y, m), _| {
+/// advancing `step` months at a time for `count` steps. `step` mirrors the
+/// RRULE INTERVAL so the anchor search only ever lands on slots the rule
+/// itself would produce.
+fn month_iter(
+    start_y: i32,
+    start_m: u32,
+    step: u16,
+    count: u32,
+) -> impl Iterator<Item = (i32, u32)> {
+    let step = step.max(1) as u32;
+    (0..count).scan((start_y, start_m), move |(y, m), _| {
         let cur = (*y, *m);
-        if *m == 12 {
-            *y += 1;
-            *m = 1;
-        } else {
-            *m += 1;
-        }
+        let advanced = *m - 1 + step;
+        *y += (advanced / 12) as i32;
+        *m = advanced % 12 + 1;
         Some(cur)
     })
 }
@@ -957,15 +967,24 @@ fn today_local(ctx: &ParseContext) -> NaiveDate {
     ctx.now_utc.with_timezone(&ctx.tz).date_naive()
 }
 
+/// Anchor for `FREQ=DAILY;INTERVAL=N`. Two candidates only: today (taken when
+/// its wall-clock time is still ahead — `*1d 22:00` sent at 20:00 fires
+/// tonight) and today + N days.
+///
+/// Scanning day by day instead would anchor *every* `*Nd` on tomorrow: without
+/// a clock override `time` is the creation time, which has by definition just
+/// passed, so the first future candidate is always today + 1 regardless of N.
+/// That made `*6d` fire the next day and only then settle into its 6-day
+/// rhythm (RULES.md: `*Nd` means the first fire is N days out).
 fn next_dtstart_for_daily(
     every_n_days: u16,
     time: NaiveTime,
     ctx: &ParseContext,
 ) -> DateTime<Utc> {
     let today = today_local(ctx);
-    let candidates = (0..=every_n_days as i64 + 1).map(|n| today + Duration::days(n));
+    let full_interval_ahead = today + Duration::days(every_n_days as i64);
     first_future_dtstart(
-        candidates,
+        [today, full_interval_ahead],
         time,
         ctx,
         ctx.now_utc + Duration::days(every_n_days as i64),
@@ -985,29 +1004,40 @@ fn next_dtstart_for_weekly(
     first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(7))
 }
 
-fn next_dtstart_for_monthly(day: u8, time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
+/// Anchor for `FREQ=MONTHLY;INTERVAL=N`. Same rule as the daily anchor: this
+/// month's slot if it's still ahead, otherwise N months out — not one.
+fn next_dtstart_for_monthly(
+    day: u8,
+    time: NaiveTime,
+    interval: u16,
+    ctx: &ParseContext,
+) -> DateTime<Utc> {
     let local_now = ctx.now_utc.with_timezone(&ctx.tz);
-    let candidates = month_iter(local_now.year(), local_now.month(), 14)
+    let candidates = month_iter(local_now.year(), local_now.month(), interval, 14)
         .filter_map(|(y, m)| NaiveDate::from_ymd_opt(y, m, day as u32));
     first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(31))
 }
 
 fn next_dtstart_for_monthly_last_day(time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
     let local_now = ctx.now_utc.with_timezone(&ctx.tz);
-    let candidates = month_iter(local_now.year(), local_now.month(), 14)
+    let candidates = month_iter(local_now.year(), local_now.month(), 1, 14)
         .filter_map(|(y, m)| NaiveDate::from_ymd_opt(y, m, last_day_of_month(y, m)));
     first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(31))
 }
 
+/// Anchor for `FREQ=YEARLY;INTERVAL=N`. This year's slot if it's still ahead,
+/// otherwise N years out — not one.
 fn next_dtstart_for_yearly(
     month: u8,
     day: u8,
     time: NaiveTime,
+    interval: u16,
     ctx: &ParseContext,
 ) -> DateTime<Utc> {
     let base_year = ctx.now_utc.with_timezone(&ctx.tz).year();
-    let candidates =
-        (0..5).filter_map(|n| NaiveDate::from_ymd_opt(base_year + n, month as u32, day as u32));
+    let step = interval.max(1) as i32;
+    let candidates = (0..5)
+        .filter_map(|n| NaiveDate::from_ymd_opt(base_year + n * step, month as u32, day as u32));
     first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(365))
 }
 

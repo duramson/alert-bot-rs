@@ -555,6 +555,80 @@ mod tests {
     }
 
     #[test]
+    fn rec_daily_anchor_is_one_full_interval_ahead() {
+        // Regression: `*6d` used to anchor on *tomorrow* (the anchor search
+        // walked day by day and the creation time has always just passed), so
+        // the first fire came a day later and only then settled into the
+        // 6-day rhythm. First fire must be 6 days out.
+        let r = p("*6d Tirz");
+        assert!(rrule(&r).contains("INTERVAL=6"));
+        assert_eq!(r.schedule.dtstart, local(2026, 5, 14, 12, 0));
+    }
+
+    #[test]
+    fn rec_daily_interval_one_anchors_tomorrow() {
+        // `*1d` without override: today's 12:00 slot is the creation instant
+        // itself, so the first fire is tomorrow — one full interval.
+        let r = p("*1d vitamin");
+        assert_eq!(r.schedule.dtstart, local(2026, 5, 9, 12, 0));
+    }
+
+    #[test]
+    fn rec_daily_override_takes_today_when_still_ahead() {
+        // `*1d 14:00` at 12:00 → tonight, not tomorrow.
+        let r = p("*1d 14:00 vitamin");
+        assert_eq!(r.schedule.dtstart, local(2026, 5, 8, 14, 0));
+    }
+
+    #[test]
+    fn rec_daily_override_skips_full_interval_when_passed() {
+        // `*2d 11:00` at 12:00 → 11:00 is gone, so +2 days, not +1.
+        let r = p("*2d 11:00 Vitamin");
+        assert_eq!(r.schedule.dtstart, local(2026, 5, 10, 11, 0));
+    }
+
+    #[test]
+    fn rec_weekly_via_days_anchor_is_one_interval_ahead() {
+        // `*1w` = 7 days → same daily rule with INTERVAL=7.
+        let r = p("*1w Muell");
+        assert!(rrule(&r).contains("INTERVAL=7"));
+        assert_eq!(r.schedule.dtstart, local(2026, 5, 15, 12, 0));
+    }
+
+    #[test]
+    fn rec_monthly_interval_anchor_skips_full_interval() {
+        // `*2M` on 8 May at 12:00 → 8 July, not 8 June.
+        let r = p("*2M abrechnung");
+        assert!(rrule(&r).contains("INTERVAL=2"));
+        assert_eq!(r.schedule.dtstart, local(2026, 7, 8, 12, 0));
+    }
+
+    #[test]
+    fn rec_yearly_interval_anchor_skips_full_interval() {
+        // `*2Y` in 2026 → 2028, not 2027.
+        let r = p("*2Y tuv");
+        assert!(rrule(&r).contains("INTERVAL=2"));
+        assert_eq!(r.schedule.dtstart, local(2028, 5, 8, 12, 0));
+    }
+
+    #[test]
+    fn rec_relative_anchor_drops_creation_seconds() {
+        // Seconds of the creation instant must not be frozen into the rule —
+        // otherwise every occurrence for years fires at :37.
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let ctx = ParseContext {
+            now_utc: tz
+                .with_ymd_and_hms(2026, 5, 8, 12, 0, 37)
+                .unwrap()
+                .with_timezone(&Utc),
+            tz,
+            language: Language::De,
+        };
+        let r = parse("*6d Tirz", &ctx).expect("parse failed");
+        assert_eq!(r.schedule.dtstart, local(2026, 5, 14, 12, 0));
+    }
+
+    #[test]
     fn rec_daily_short_with_time_override() {
         // `*2d 11:00` fires every 2 days at 11:00 — the override wins over the
         // 12:00 creation time and must not leak into the reminder text.

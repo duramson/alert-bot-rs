@@ -191,13 +191,19 @@ einmaligen Befehlen.
 |---|---|
 | `/alert *30m text` | alle 30 Minuten, erste Feuerung in 30 Minuten |
 | `/alert *3h text` | alle 3 Stunden, erste Feuerung in 3 Stunden |
-| `/alert *2d text` | alle 2 Tage zur Erstellungs-Uhrzeit |
+| `/alert *2d text` | alle 2 Tage zur Erstellungs-Uhrzeit, erste Feuerung in 2 Tagen |
 | `/alert *2d 11:00 text` | alle 2 Tage um 11:00 (override) |
 | `/alert *3M text` | jeden Monat + 3, gleicher Monatstag, gleiche Uhrzeit |
 | `/alert *3M 18:00 text` | gleiche Monatstag-Logik, aber um 18:00 |
 | `/alert *1Y text` | jährlich, gleiches Datum, gleiche Uhrzeit |
 | `/alert alle 2d 11:00 text` | identisch zu `*2d 11:00 text` |
 | `/alert jeden 7d 9:00 text` | identisch zu `*7d 9:00 text` |
+
+**Erste Feuerung.** Bei jedem `*N<Einheit>` liegt die erste Feuerung ein volles
+Intervall in der Zukunft — `*6d` also in 6 Tagen, nicht morgen. Ausnahme: mit
+Uhrzeit-Override, dessen Uhrzeit heute (bzw. in diesem Monat/Jahr) noch
+bevorsteht, wird dieser nächstgelegene Slot genommen — `*1d 22:00` um 20:00
+feuert also noch heute Abend.
 
 ### Wochentage
 
