@@ -30,7 +30,8 @@ use crate::render;
 const MAX_ATTEMPTS: i16 = 5;
 const STALE_CLAIM_SECS: i64 = 60;
 const REAPER_INTERVAL: Duration = Duration::from_secs(30);
-const CLAIM_BATCH: i64 = 100;
+// Do not reserve a queue whose entries could expire before we send them.
+const CLAIM_BATCH: i64 = 1;
 /// A delivery is "delayed" if it fires more than this far behind its
 /// scheduled time. Below this we treat it as normal latency.
 const DELAYED_THRESHOLD_SECS: i64 = 60;
@@ -102,8 +103,7 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         alert.text.clone()
     };
 
-    let keyboard =
-        handlers::delivery_keyboard(lang, alert.id, alert.schedule.is_recurring());
+    let keyboard = handlers::delivery_keyboard(lang, alert.id, alert.schedule.is_recurring());
     let send = bot
         .send_message(ChatId(alert.chat_id), &body)
         .reply_markup(keyboard)
@@ -119,8 +119,15 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         Err(teloxide::RequestError::RetryAfter(seconds)) => {
             // Telegram global/group rate limit. Reschedule and retry.
             let new_fire = Utc::now() + chrono::Duration::seconds(seconds.seconds() as i64 + 1);
-            warn!(id = alert.id, retry_in = seconds.seconds(), "telegram 429, rescheduling");
-            if let Err(e) = store.reschedule(alert.id, new_fire).await {
+            warn!(
+                id = alert.id,
+                retry_in = seconds.seconds(),
+                "telegram 429, rescheduling"
+            );
+            if let Err(e) = store
+                .reschedule(alert.id, alert.claim_generation, new_fire)
+                .await
+            {
                 error!(id = alert.id, error = ?e, "reschedule failed");
             }
         }
@@ -130,7 +137,11 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
             // Permanent: nobody to deliver to.
             warn!(id = alert.id, "permanent delivery failure");
             if let Err(e) = store
-                .mark_failed(alert.id, "permanent: delivery target unreachable")
+                .mark_failed(
+                    alert.id,
+                    alert.claim_generation,
+                    "permanent: delivery target unreachable",
+                )
                 .await
             {
                 error!(id = alert.id, error = ?e, "mark_failed failed");
@@ -141,14 +152,25 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
             if alert.attempts >= MAX_ATTEMPTS {
                 let msg = format!("max attempts: {e}");
                 warn!(id = alert.id, attempts = alert.attempts, "giving up");
-                if let Err(e) = store.mark_failed(alert.id, &msg).await {
+                if let Err(e) = store
+                    .mark_failed(alert.id, alert.claim_generation, &msg)
+                    .await
+                {
                     error!(id = alert.id, error = ?e, "mark_failed failed");
                 }
             } else {
                 let backoff = 5_i64 << alert.attempts.min(6);
                 let new_fire = Utc::now() + chrono::Duration::seconds(backoff);
-                warn!(id = alert.id, attempt = alert.attempts, backoff, "transient error, retrying");
-                if let Err(e) = store.reschedule(alert.id, new_fire).await {
+                warn!(
+                    id = alert.id,
+                    attempt = alert.attempts,
+                    backoff,
+                    "transient error, retrying"
+                );
+                if let Err(e) = store
+                    .reschedule(alert.id, alert.claim_generation, new_fire)
+                    .await
+                {
                     error!(id = alert.id, error = ?e, "reschedule failed");
                 }
             }
@@ -161,19 +183,26 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
 /// the past N intervals back-to-back) and reschedule. Otherwise mark sent.
 async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<()> {
     let applied = if !alert.schedule.is_recurring() {
-        store.mark_sent(alert.id).await?
+        store.mark_sent(alert.id, alert.claim_generation).await?
     } else {
         let now = Utc::now();
         match alert.schedule.next_after(now) {
-            Some(next) => store.advance_to_next_occurrence(alert.id, next).await?,
-            None => store.mark_sent(alert.id).await?,
+            Some(next) => {
+                store
+                    .advance_to_next_occurrence(alert.id, alert.claim_generation, next)
+                    .await?
+            }
+            None => store.mark_sent(alert.id, alert.claim_generation).await?,
         }
     };
     if !applied {
-        // The state guard rejected the write: the reaper released our claim
+        // The claim guard rejected the write: the reaper released our claim
         // while the send was in flight and the row was re-claimed or cancelled
         // meanwhile. Don't resurrect it — just note the wasted double-send.
-        warn!(id = alert.id, "delivered but claim was no longer ours; not finalising");
+        warn!(
+            id = alert.id,
+            "delivered but claim was no longer ours; not finalising"
+        );
     }
     Ok(())
 }

@@ -133,7 +133,7 @@ impl PgStore {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
                       dtstart, rrule, tz,
-                      state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+                      state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
             "#,
         )
         .bind(new.user_id)
@@ -156,7 +156,7 @@ impl PgStore {
             r#"
             SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
                    dtstart, rrule, tz,
-                   state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+                   state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
             FROM alerts WHERE id = $1
             "#,
         )
@@ -174,7 +174,7 @@ impl PgStore {
             r#"
             SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
                    dtstart, rrule, tz,
-                   state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+                   state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
             FROM alerts
             WHERE chat_id = $1 AND state IN ('pending', 'claimed')
             ORDER BY fire_at ASC
@@ -220,6 +220,7 @@ impl PgStore {
             UPDATE alerts
             SET state = 'claimed',
                 attempts = attempts + 1,
+                claim_generation = claim_generation + 1,
                 claimed_at = now(),
                 updated_at = now()
             WHERE id IN (
@@ -231,7 +232,7 @@ impl PgStore {
             )
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
                       dtstart, rrule, tz,
-                      state, attempts, last_error, claimed_at, fired_at, created_at, updated_at
+                      state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
             "#,
         )
         .bind(limit)
@@ -240,29 +241,28 @@ impl PgStore {
         rows.into_iter().map(row_to_alert).collect()
     }
 
-    /// Terminal/retry transitions after a delivery attempt guard on
-    /// `state = 'claimed'`: the worker only owns a row while it holds the claim.
-    /// If the reaper released a slow claim (or a second worker re-claimed, or the
-    /// user cancelled), the row is no longer ours and the write must be a no-op —
-    /// otherwise a late-completing send would resurrect a cancelled series or
-    /// clobber another worker's state. Return whether the transition applied.
-    pub async fn mark_sent(&self, id: i64) -> Result<bool> {
+    /// Only the current claim generation may finish or retry a delivery.
+    /// State alone is insufficient: the reaper can release a claim and a new
+    /// worker can claim the same row before the original worker completes.
+    pub async fn mark_sent(&self, id: i64, generation: i64) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE alerts SET state = 'sent', fired_at = now(), updated_at = now()
-             WHERE id = $1 AND state = 'claimed'",
+             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
         )
         .bind(id)
+        .bind(generation)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() == 1)
     }
 
-    pub async fn mark_failed(&self, id: i64, error: &str) -> Result<bool> {
+    pub async fn mark_failed(&self, id: i64, generation: i64, error: &str) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE alerts SET state = 'failed', last_error = $2, updated_at = now()
-             WHERE id = $1 AND state = 'claimed'",
+            "UPDATE alerts SET state = 'failed', last_error = $3, updated_at = now()
+             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
         )
         .bind(id)
+        .bind(generation)
         .bind(error)
         .execute(&self.pool)
         .await?;
@@ -272,12 +272,18 @@ impl PgStore {
     /// Re-queue: bumps `state` back to `pending` with a new `fire_at`.
     /// Used by retry logic when Telegram returns 429 (rate-limited).
     /// Deliberately keeps `attempts` — it's the same occurrence being retried.
-    pub async fn reschedule(&self, id: i64, fire_at: DateTime<Utc>) -> Result<bool> {
+    pub async fn reschedule(
+        &self,
+        id: i64,
+        generation: i64,
+        fire_at: DateTime<Utc>,
+    ) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL, updated_at = now()
-             WHERE id = $1 AND state = 'claimed'",
+            "UPDATE alerts SET state = 'pending', fire_at = $3, claimed_at = NULL, updated_at = now()
+             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
         )
         .bind(id)
+        .bind(generation)
         .bind(fire_at)
         .execute(&self.pool)
         .await?;
@@ -289,13 +295,19 @@ impl PgStore {
     /// over the alert's lifetime — without the reset a long-lived series would
     /// hit MAX_ATTEMPTS after enough successful deliveries and die on the first
     /// transient error (and eventually overflow the SMALLINT column).
-    pub async fn advance_to_next_occurrence(&self, id: i64, fire_at: DateTime<Utc>) -> Result<bool> {
+    pub async fn advance_to_next_occurrence(
+        &self,
+        id: i64,
+        generation: i64,
+        fire_at: DateTime<Utc>,
+    ) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE alerts SET state = 'pending', fire_at = $2, claimed_at = NULL,
+            "UPDATE alerts SET state = 'pending', fire_at = $3, claimed_at = NULL,
                                attempts = 0, updated_at = now()
-             WHERE id = $1 AND state = 'claimed'",
+             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
         )
         .bind(id)
+        .bind(generation)
         .bind(fire_at)
         .execute(&self.pool)
         .await?;
@@ -482,8 +494,152 @@ fn row_to_alert(row: PgRow) -> Result<Alert> {
         attempts: row.try_get("attempts")?,
         last_error: row.try_get("last_error")?,
         claimed_at: row.try_get("claimed_at")?,
+        claim_generation: row.try_get("claim_generation")?,
         fired_at: row.try_get("fired_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn due_alert(store: &PgStore, text: &str) -> Alert {
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = Utc::now() - chrono::Duration::minutes(1);
+        store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: 42,
+                chat_type: ChatType::Private,
+                scope: AlertScope::Private,
+                text: text.into(),
+                fire_at: at,
+                schedule: Schedule::one_shot(at, chrono_tz::UTC),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn expire_claim(store: &PgStore, id: i64) {
+        sqlx::query("UPDATE alerts SET claimed_at = now() - interval '61 seconds' WHERE id = $1")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(store.release_stale_claims(60).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn stale_generation_cannot_mutate_a_reassigned_claim(pool: PgPool) {
+        let store = PgStore { pool };
+        let original = due_alert(&store, "first").await;
+        let waiting = due_alert(&store, "second").await;
+        let old = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert_eq!(old.id, original.id);
+        assert_eq!(
+            store.get_alert(waiting.id).await.unwrap().unwrap().state,
+            AlertState::Pending
+        );
+        assert_eq!(store.list_active_for_chat(42).await.unwrap().len(), 2);
+        expire_claim(&store, old.id).await;
+        let current = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert_eq!(current.id, old.id);
+        assert!(current.claim_generation > old.claim_generation);
+        let next = Utc::now() + chrono::Duration::hours(1);
+        assert!(!store.mark_sent(old.id, old.claim_generation).await.unwrap());
+        assert!(!store
+            .mark_failed(old.id, old.claim_generation, "late failure")
+            .await
+            .unwrap());
+        assert!(!store
+            .reschedule(old.id, old.claim_generation, next)
+            .await
+            .unwrap());
+        assert!(!store
+            .advance_to_next_occurrence(old.id, old.claim_generation, next)
+            .await
+            .unwrap());
+        let unchanged = store.get_alert(old.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.state, AlertState::Claimed);
+        assert_eq!(unchanged.fire_at, current.fire_at);
+        assert_eq!(unchanged.attempts, current.attempts);
+        assert_eq!(unchanged.last_error, None);
+        assert!(store
+            .advance_to_next_occurrence(current.id, current.claim_generation, next)
+            .await
+            .unwrap());
+        let advanced = store.get_alert(old.id).await.unwrap().unwrap();
+        assert_eq!(advanced.state, AlertState::Pending);
+        assert_eq!(advanced.attempts, 0);
+        assert_eq!(advanced.claim_generation, current.claim_generation);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn late_worker_cannot_resurrect_a_cancelled_alert(pool: PgPool) {
+        let store = PgStore { pool };
+        due_alert(&store, "cancel me").await;
+        let old = store.claim_due_alerts(1).await.unwrap().remove(0);
+        expire_claim(&store, old.id).await;
+        assert!(store.cancel_alert(old.id, 42).await.unwrap());
+        assert!(!store.mark_sent(old.id, old.claim_generation).await.unwrap());
+        assert!(!store
+            .mark_failed(old.id, old.claim_generation, "late")
+            .await
+            .unwrap());
+        assert!(!store
+            .reschedule(old.id, old.claim_generation, Utc::now())
+            .await
+            .unwrap());
+        assert!(!store
+            .advance_to_next_occurrence(old.id, old.claim_generation, Utc::now())
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_alert(old.id).await.unwrap().unwrap().state,
+            AlertState::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn concurrent_claims_and_retry_transitions_keep_ownership(pool: PgPool) {
+        let store = PgStore { pool };
+        due_alert(&store, "one").await;
+        due_alert(&store, "two").await;
+        let (a, b) = tokio::join!(store.claim_due_alerts(1), store.claim_due_alerts(1));
+        let (a, b) = (a.unwrap().remove(0), b.unwrap().remove(0));
+        assert_ne!(a.id, b.id);
+        assert!(store.mark_sent(a.id, a.claim_generation).await.unwrap());
+        assert!(!store.mark_sent(a.id, a.claim_generation).await.unwrap());
+        assert!(store
+            .reschedule(
+                b.id,
+                b.claim_generation,
+                Utc::now() - chrono::Duration::seconds(1)
+            )
+            .await
+            .unwrap());
+        let retry = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert_eq!(retry.id, b.id);
+        assert!(retry.claim_generation > b.claim_generation);
+        assert_eq!(retry.attempts, b.attempts + 1);
+        assert!(store
+            .mark_failed(retry.id, retry.claim_generation, "failed")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get_alert(retry.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("failed")
+        );
+    }
 }
