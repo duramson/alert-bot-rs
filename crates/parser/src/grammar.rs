@@ -280,7 +280,7 @@ impl RelSpec {
         }
         // Pre-check the obvious case (`100Y`) before doing any calendar math.
         // A post-check below still catches weird combos like `100000d`.
-        if self.years as i32 > MAX_RELATIVE_YEARS {
+        if self.years > MAX_RELATIVE_YEARS as u32 {
             return Err(ParseError::RelTooFar(MAX_RELATIVE_YEARS));
         }
 
@@ -289,10 +289,13 @@ impl RelSpec {
                 + self.hours as i64 * 3600
                 + self.minutes as i64 * 60
                 + self.seconds as i64;
-            let result = base_utc + Duration::seconds(secs);
-            if result - base_utc > Duration::days(MAX_RELATIVE_YEARS as i64 * 366) {
+            let offset = Duration::seconds(secs);
+            if offset > Duration::days(MAX_RELATIVE_YEARS as i64 * 366) {
                 return Err(ParseError::RelTooFar(MAX_RELATIVE_YEARS));
             }
+            let result = base_utc
+                .checked_add_signed(offset)
+                .ok_or(ParseError::RelTooFar(MAX_RELATIVE_YEARS))?;
             return Ok((result, notes));
         }
 
@@ -332,10 +335,14 @@ impl RelSpec {
             }
         }
         if self.weeks > 0 {
-            target_date += Duration::days(self.weeks as i64 * 7);
+            target_date = target_date
+                .checked_add_signed(Duration::days(self.weeks as i64 * 7))
+                .ok_or(ParseError::RelTooFar(MAX_RELATIVE_YEARS))?;
         }
         if self.days > 0 {
-            target_date += Duration::days(self.days as i64);
+            target_date = target_date
+                .checked_add_signed(Duration::days(self.days as i64))
+                .ok_or(ParseError::RelTooFar(MAX_RELATIVE_YEARS))?;
         }
 
         let time = override_time.unwrap_or(base_time);
@@ -345,7 +352,9 @@ impl RelSpec {
             let secs = self.hours as i64 * 3600
                 + self.minutes as i64 * 60
                 + self.seconds as i64;
-            result += Duration::seconds(secs);
+            result = result
+                .checked_add_signed(Duration::seconds(secs))
+                .ok_or(ParseError::RelTooFar(MAX_RELATIVE_YEARS))?;
         }
         // Post-check: catches huge non-Y specs like `100000d` (~274 years).
         if result - base_utc > Duration::days(MAX_RELATIVE_YEARS as i64 * 366) {
@@ -784,7 +793,9 @@ fn try_recurring_relative(
         let dtstart = next_dtstart_for_daily(every_n_days, time, ctx);
         Schedule::daily_at(dtstart, ctx.tz, every_n_days, time)?
     } else {
-        let dtstart = ctx.now_utc + Duration::seconds(total_secs);
+        let dtstart = ctx.now_utc
+            .checked_add_signed(Duration::seconds(total_secs))
+            .ok_or(ParseError::InvalidRecurrenceSpec)?;
         Schedule::interval_seconds(dtstart, ctx.tz, total_secs)?
     };
     Ok(Some((schedule, end_offset, None)))
@@ -1064,4 +1075,3 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
     }
     28
 }
-
