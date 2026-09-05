@@ -164,6 +164,8 @@ pub struct Alert {
     pub attempts: i16,
     pub last_error: Option<String>,
     pub claimed_at: Option<DateTime<Utc>>,
+    /// Monotonically increases on every claim, including after successful occurrences.
+    pub claim_generation: i64,
     pub fired_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
