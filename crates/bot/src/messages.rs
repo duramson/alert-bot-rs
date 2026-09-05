@@ -255,6 +255,13 @@ pub fn snooze_gone(lang: Language) -> &'static str {
     }
 }
 
+pub fn snooze_invalid_offset(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Bitte wähle +5min, +15min oder +1h.",
+        Language::En => "Please choose +5min, +15min or +1h.",
+    }
+}
+
 pub fn series_stopped(lang: Language, id: i64) -> String {
     match lang {
         Language::De => format!("✗ Serie #{id} beendet."),

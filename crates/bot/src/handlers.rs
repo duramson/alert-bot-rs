@@ -523,6 +523,12 @@ async fn handle_snooze_callback(
     offset_secs: i64,
     alert_id: i64,
 ) -> HandlerResult {
+    let Some(fire_at) = snooze_fire_at(offset_secs, Utc::now()) else {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::snooze_invalid_offset(user.language))
+            .await?;
+        return Ok(());
+    };
     let Some(original) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::snooze_gone(user.language))
@@ -559,7 +565,6 @@ async fn handle_snooze_callback(
         return Ok(());
     }
 
-    let fire_at = Utc::now() + chrono::Duration::seconds(offset_secs);
     let new = NewAlert {
         user_id: user.telegram_id,
         chat_id: original.chat_id,
@@ -586,6 +591,14 @@ async fn handle_snooze_callback(
         .await?;
     bot.answer_callback_query(query.id.clone()).await?;
     Ok(())
+}
+
+/// Callback data is untrusted, even when the originating chat is valid.
+fn snooze_fire_at(offset_secs: i64, now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
+    if !matches!(offset_secs, 300 | 900 | 3600) {
+        return None;
+    }
+    now.checked_add_signed(chrono::Duration::seconds(offset_secs))
 }
 
 /// Stop the recurring series: reuses the existing `cancel_alert` flow (which
@@ -696,6 +709,18 @@ mod tests {
     use super::*;
     use teloxide::types::InlineKeyboardButtonKind;
 
+    #[test]
+    fn snooze_only_accepts_offered_intervals() {
+        let now = Utc::now();
+        for offset in [i64::MIN, -300, 0, 1, 299, 301, 86400, i64::MAX] {
+            assert_eq!(snooze_fire_at(offset, now), None, "offset {offset}");
+        }
+        for offset in [300, 900, 3600] {
+            assert_eq!(snooze_fire_at(offset, now), Some(now + chrono::Duration::seconds(offset)));
+        }
+        assert_eq!(snooze_fire_at(300, chrono::DateTime::<Utc>::MAX_UTC), None);
+    }
+
     fn callback_data(btn: &InlineKeyboardButton) -> &str {
         match &btn.kind {
             InlineKeyboardButtonKind::CallbackData(s) => s,
@@ -722,4 +747,3 @@ mod tests {
         assert_eq!(callback_data(&row[3]), "stop_series:7");
     }
 }
-
