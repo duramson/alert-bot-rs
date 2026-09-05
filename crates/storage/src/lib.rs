@@ -4,7 +4,7 @@
 //! `query!` macros, so the workspace builds without a live database. Once the
 //! schema has stabilised, swap call sites for the macros and add a `.sqlx/`
 //! offline cache to keep CI fast. Validation today happens through the
-//! integration tests in `tests/`.
+//! isolated PostgreSQL tests in this module (`cargo test -- --ignored`).
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;

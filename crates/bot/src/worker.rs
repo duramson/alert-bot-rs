@@ -5,7 +5,7 @@
 //!     future if there are no pending alerts.
 //!  2. Wait for whichever happens first: that timestamp, a `NOTIFY` from the
 //!     DB (new alert / cancellation), or shutdown.
-//!  3. Atomically claim up to N due alerts via `FOR UPDATE SKIP LOCKED`.
+//!  3. Atomically claim one due alert via `FOR UPDATE SKIP LOCKED`.
 //!  4. For each: send via Bot API, mark sent. On 429 reschedule, on 4xx other
 //!     than 429 mark failed, on transient error retry up to MAX_ATTEMPTS.
 

@@ -2,7 +2,11 @@
 
 Eine konsistente Spezifikation aller Eingabeformate. Diese Datei ist die
 Quelle der Wahrheit — wenn die Implementierung abweicht, ist die
-Implementierung falsch.
+Implementierung falsch. Bekannte Abweichungen stehen in der lokalen, nicht versionierten `TODO.md`;
+diese Spezifikation ist keine Behauptung vollständiger Implementierung.
+
+This German-language document specifies the intended input semantics. Known
+implementation gaps are tracked locally in the unversioned `TODO.md`.
 
 ## Zwei Default-Regeln, immer
 
@@ -242,7 +246,9 @@ feuert also noch heute Abend.
 - Wiederholungen brauchen **minimum 30 Minuten** Interval. Kleinere Werte
   werden mit Hinweis abgelehnt.
 - Relative One-shots sind auf maximal **50 Jahre** ab jetzt gekappt, mit
-  Hinweis bei Überschreitung. Wiederholungen haben keine Obergrenze.
+  Hinweis bei Überschreitung. Wiederholungen haben keine festgelegte Endanzahl;
+  die Intervallgröße muss jedoch in die verwendete RRULE-Einheit passen
+  (maximal 65535) und der Zeitpunkt darstellbar sein. Größere Werte werden abgelehnt.
 - Tippfehler in Wochentag-/Monatsnamen werden fuzzy korrigiert
   (Levenshtein-Distanz adaptiv: ≤ 3 Zeichen exakt, 4-5 Zeichen Distanz ≤ 1,
   ab 6 Zeichen Distanz ≤ 2). Reminder-Text wird **nie** fuzzy korrigiert.
