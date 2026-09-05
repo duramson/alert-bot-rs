@@ -7,7 +7,7 @@ use teloxide::update_listeners::webhooks;
 use teloxide::prelude::*;
 use teloxide::types::BotCommand;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         ))
         .await;
 
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = CancellationToken::new();
 
     let worker_handle = {
         let bot = bot.clone();
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    shutdown.notify_waiters();
+    shutdown.cancel();
     match worker_handle.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -295,7 +295,7 @@ async fn register_command_menus(bot: &Bot) {
 }
 
 fn spawn_signal_handler(
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     dispatcher_token: ShutdownToken,
     notifier: AdminNotifier,
 ) {
@@ -334,6 +334,6 @@ fn spawn_signal_handler(
         }
         // Wake the worker too. The dispatcher's awaiter in main() will
         // resolve on its own once `shutdown()` above propagates.
-        shutdown.notify_waiters();
+        shutdown.cancel();
     });
 }

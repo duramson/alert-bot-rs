@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgListener;
 use teloxide::prelude::*;
 use teloxide::ApiError;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -36,7 +36,7 @@ const CLAIM_BATCH: i64 = 1;
 /// scheduled time. Below this we treat it as normal latency.
 const DELAYED_THRESHOLD_SECS: i64 = 60;
 
-pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: Arc<Notify>) -> anyhow::Result<()> {
+pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: CancellationToken) -> anyhow::Result<()> {
     let mut listener = PgListener::connect_with(store.pool()).await?;
     listener.listen("alerts_changed").await?;
     info!("worker listening on `alerts_changed`");
@@ -48,11 +48,15 @@ pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: Arc<Notify>) -> anyhow
     });
 
     loop {
-        let next_wake = compute_next_wake(&store).await;
+        let next_wake = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            next = compute_next_wake(&store) => next,
+        };
 
         tokio::select! {
             biased;
-            _ = shutdown.notified() => {
+            _ = shutdown.cancelled() => {
                 info!("worker shutting down");
                 return Ok(());
             }
@@ -227,10 +231,10 @@ async fn sleep_until(target: DateTime<Utc>) {
     sleep(delta).await;
 }
 
-async fn reaper_loop(store: Arc<PgStore>, shutdown: Arc<Notify>) {
+async fn reaper_loop(store: Arc<PgStore>, shutdown: CancellationToken) {
     loop {
         tokio::select! {
-            _ = shutdown.notified() => return,
+            _ = shutdown.cancelled() => return,
             _ = sleep(REAPER_INTERVAL) => {}
         }
 
@@ -243,5 +247,80 @@ async fn reaper_loop(store: Arc<PgStore>, shutdown: Arc<Notify>) {
             Ok(_) => {}
             Err(e) => error!(error = ?e, "purge_old_updates failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use botcore::{AlertScope, AlertState, ChatType, NewAlert, Schedule};
+    use sqlx::{ConnectOptions, PgPool};
+    use tokio::sync::Notify;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn shutdown_during_delivery_finishes_the_send_and_exits(pool: PgPool) {
+        let store = Arc::new(
+            PgStore::connect(pool.connect_options().to_url_lossy().as_str(), 5)
+                .await
+                .unwrap(),
+        );
+        store.upsert_user(42, Language::En).await.unwrap();
+        let at = Utc::now() - chrono::Duration::seconds(1);
+        let alert = store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: 42,
+                chat_type: ChatType::Private,
+                scope: AlertScope::Private,
+                text: "test".into(),
+                fire_at: at,
+                schedule: Schedule::one_shot(at, chrono_tz::UTC),
+            })
+            .await
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = axum::Router::new().fallback({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":42,"type":"private","first_name":"Test"},"text":"test"}}"#
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run(
+            Bot::new("123:test").set_api_url(url),
+            store.clone(),
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        // Cancel while the worker is busy, with no cancellation waiter installed.
+        shutdown.cancel();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.get_alert(alert.id).await.unwrap().unwrap().state,
+            AlertState::Sent
+        );
+        server.abort();
+        store.pool().close().await;
     }
 }
