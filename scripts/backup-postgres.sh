@@ -36,19 +36,22 @@ REMOTE_TMP="${REMOTE_FILE}.part"
 
 echo "[backup] dumping ${DB_NAME} → ${REMOTE_FILE}"
 
-# Stream to a .part name and only rename to the final name once the whole
-# pipeline succeeded. If pg_dump dies mid-stream, set -o pipefail aborts the
-# transfer, curl exits non-zero, and the post-transfer rename (the leading '-'
-# makes curl run it *after* a successful upload) never fires — so a truncated
-# dump can never masquerade as the latest good backup under the real name.
+# Upload only to .part. A successful curl transfer does not imply pg_dump
+# succeeded: gzip can close a valid stream after an incomplete dump. Wait for
+# pipefail to check every stage before starting a separate rename request.
 pg_dump --clean --if-exists --no-owner --no-privileges "${DB_NAME}" \
   | gzip -9 \
   | curl --silent --show-error --fail \
          --user "${BACKUP_NETCUP_USER}:${BACKUP_NETCUP_PASS}" \
          --upload-file - \
          --ftp-create-dirs \
-         --quote "-rename ${REMOTE_TMP} ${REMOTE_FILE}" \
          "sftp://${BACKUP_NETCUP_HOST}/${REMOTE_TMP}"
+
+curl --silent --show-error --fail \
+     --user "${BACKUP_NETCUP_USER}:${BACKUP_NETCUP_PASS}" \
+     --quote "rename ${REMOTE_TMP} ${REMOTE_FILE}" \
+     --output /dev/null \
+     "sftp://${BACKUP_NETCUP_HOST}/${BACKUP_NETCUP_PATH}/"
 
 echo "[backup] uploaded"
 
