@@ -20,13 +20,13 @@ use axum::{
     routing::get,
     Router,
 };
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use storage::PgStore;
 
 /// Serve `GET /stats` until `shutdown` is notified.
-pub async fn run(store: Arc<PgStore>, listen: SocketAddr, shutdown: Arc<Notify>) -> Result<()> {
+pub async fn run(store: Arc<PgStore>, listen: SocketAddr, shutdown: CancellationToken) -> Result<()> {
     let app = Router::new()
         .route("/stats", get(stats_handler))
         .with_state(store);
@@ -37,7 +37,7 @@ pub async fn run(store: Arc<PgStore>, listen: SocketAddr, shutdown: Arc<Notify>)
     info!(%listen, "stats endpoint listening on /stats");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.notified().await })
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .context("stats server error")?;
     Ok(())
