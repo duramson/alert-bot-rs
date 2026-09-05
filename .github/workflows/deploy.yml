@@ -38,6 +38,8 @@ jobs:
           cache-on-failure: true
       - name: cargo test --workspace
         run: cargo test --workspace --quiet
+      - name: Backup failure regression tests
+        run: python3 -m unittest discover -s tests -v
 
   deploy:
     name: Build & deploy to LXC
