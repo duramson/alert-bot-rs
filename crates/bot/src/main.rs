@@ -114,48 +114,74 @@ async fn main() -> Result<()> {
         notifier.clone(),
     );
 
-    match config.transport {
-        Transport::Webhook {
-            listen,
-            url,
-            secret,
-        } => {
-            let mut options = webhooks::Options::new(listen, url);
-            if let Some(s) = secret {
-                options = options.secret_token(s);
+    let dispatch = async {
+        match config.transport {
+            Transport::Webhook {
+                listen,
+                url,
+                secret,
+            } => {
+                let mut options = webhooks::Options::new(listen, url);
+                if let Some(s) = secret {
+                    options = options.secret_token(s);
+                }
+                let listener = webhooks::axum(bot.clone(), options)
+                    .await
+                    .context("setting up webhook listener")?;
+                dispatcher
+                    .dispatch_with_listener(
+                        listener,
+                        LoggingErrorHandler::with_custom_text("webhook listener error"),
+                    )
+                    .await;
             }
-            let listener = webhooks::axum(bot.clone(), options)
-                .await
-                .context("setting up webhook listener")?;
-            dispatcher
-                .dispatch_with_listener(
-                    listener,
-                    LoggingErrorHandler::with_custom_text("webhook listener error"),
-                )
-                .await;
+            Transport::Polling => {
+                // Local-dev fallback. Requires no public endpoint.
+                dispatcher.dispatch().await;
+            }
         }
-        Transport::Polling => {
-            // Local-dev fallback. Requires no public endpoint.
-            dispatcher.dispatch().await;
-        }
-    }
-
-    shutdown.cancel();
-    match worker_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            notifier
-                .notify(&format!("💥 <b>worker exited with error</b>\n{e}"))
-                .await;
-        }
-        Err(join_err) => {
-            notifier
-                .notify(&format!("💥 <b>worker panicked</b>\n{join_err}"))
-                .await;
-        }
+        Ok(())
+    };
+    let result = supervise(dispatch, worker_handle, shutdown).await;
+    if let Err(e) = &result {
+        tracing::error!(error = ?e, "bot stopped after task failure");
+        notifier
+            .notify(&format!(
+                "💥 alert-bot failed: {}",
+                teloxide::utils::html::escape(&format!("{e:#}"))
+            ))
+            .await;
     }
     notifier.notify("🛑 alert-bot stopped").await;
-    Ok(())
+    result
+}
+
+/// Observe the worker while dispatching. A dead delivery task must fail the
+/// process so the service manager can restart it. During a requested shutdown,
+/// let both tasks finish their in-flight work.
+async fn supervise(
+    dispatch: impl std::future::Future<Output = Result<()>>,
+    mut worker: tokio::task::JoinHandle<Result<()>>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    tokio::pin!(dispatch);
+    tokio::select! {
+        result = &mut dispatch => {
+            shutdown.cancel();
+            let worker_result = worker.await.context("worker task failed")?;
+            result?;
+            worker_result.context("worker exited with error")
+        }
+        result = &mut worker => {
+            let stopping = shutdown.is_cancelled();
+            shutdown.cancel();
+            result.context("worker task failed")?.context("worker exited with error")?;
+            if !stopping {
+                anyhow::bail!("worker exited unexpectedly");
+            }
+            dispatch.await
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,4 +362,74 @@ fn spawn_signal_handler(
         // resolve on its own once `shutdown()` above propagates.
         shutdown.cancel();
     });
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+    use std::future::pending;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn worker_failures_interrupt_a_running_dispatcher() {
+        for outcome in 0..3 {
+            let shutdown = CancellationToken::new();
+            let worker = tokio::spawn(async move {
+                match outcome {
+                    0 => anyhow::bail!("listener connection failed"),
+                    1 => panic!("worker panic"),
+                    _ => Ok(()),
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                supervise(pending(), worker, shutdown.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err());
+            assert!(shutdown.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exit_cancels_and_joins_worker() {
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let worker = tokio::spawn(async move {
+            token.cancelled().await;
+            Ok(())
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            supervise(async { Ok(()) }, worker, shutdown),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_waits_for_dispatcher_to_drain() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let worker = tokio::spawn(async { Ok(()) });
+        let (done, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(supervise(
+            async {
+                receiver.await?;
+                Ok(())
+            },
+            worker,
+            shutdown,
+        ));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        done.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
