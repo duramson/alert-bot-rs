@@ -22,7 +22,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
 
 # Standalone HTTP server for the read-only /stats endpoint (Homepage widget).
-# Pinned to 0.7 so it unifies with the axum teloxide's webhooks-axum already
+# Pinned to 0.8 so it unifies with the axum teloxide's webhooks-axum already
 # pulls — no duplicate axum/hyper in the tree.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 
