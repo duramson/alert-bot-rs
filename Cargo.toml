@@ -15,8 +15,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.41", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
 
 # Telegram (pulls axum transitively via the `webhooks-axum` feature)
 teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
@@ -24,16 +24,16 @@ teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
 # Standalone HTTP server for the read-only /stats endpoint (Homepage widget).
 # Pinned to 0.8 so it unifies with the axum teloxide's webhooks-axum already
 # pulls — no duplicate axum/hyper in the tree.
-axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1"] }
 
 # HTTP client we hand to teloxide explicitly so we can set tcp_keepalive and
 # tighter pool_idle_timeout — defaults let pooled HTTPS conns to api.telegram.org
 # go silently dead behind NAT, then the first SendMessage after idle hangs in
 # Connect-TimedOut and the user has to retry.
-reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["default-tls"] }
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9.0", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
     "chrono",
@@ -42,36 +42,36 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = { version = "0.10", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = { version = "0.10.4", features = ["serde"] }
 
 # Parser
-strsim = "0.11"
+strsim = "0.11.1"
 
 # iCalendar RRULE — single source of truth for recurrence semantics.
 # Parser builds RRules; storage serialises them as RFC-5545 strings.
 rrule = "0.14"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Errors
-thiserror = "2"
-anyhow = "1"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
 
 # Serde (used by core for enum derives + chrono/chrono-tz feature flags)
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 
 # Misc
-dotenvy = "0.15"
-url = "2"
+dotenvy = "0.15.7"
+url = "2.5.8"
 
 # Rate limiting (in-memory token bucket per Telegram user_id).
-governor = "0.10"
+governor = "0.10.4"
 
 # Benchmarking (dev-only)
-criterion = "0.8"
+criterion = "0.8.2"
 
 # Internal
 parser = { path = "crates/parser" }
