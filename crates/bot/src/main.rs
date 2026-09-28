@@ -188,7 +188,7 @@ async fn supervise(
 // Config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+// No Debug: holds BOT_TOKEN and DATABASE_URL.
 struct Config {
     bot_token: String,
     database_url: String,
@@ -199,7 +199,6 @@ struct Config {
     stats_listen: Option<SocketAddr>,
 }
 
-#[derive(Debug)]
 enum Transport {
     Webhook {
         listen: SocketAddr,
@@ -207,6 +206,22 @@ enum Transport {
         secret: Option<String>,
     },
     Polling,
+}
+
+// Hand-written so the startup log never prints WEBHOOK_SECRET: the deploy
+// job tails the journal into public GitHub Actions logs.
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Webhook { listen, url, secret } => f
+                .debug_struct("Webhook")
+                .field("listen", listen)
+                .field("url", &url.as_str())
+                .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Transport::Polling => f.write_str("Polling"),
+        }
+    }
 }
 
 impl Config {
