@@ -12,8 +12,5 @@ docker-compose.override.yml
 # Lokale Entwickler-/Agent-Notizen — nicht im Repo
 AGENTS.md
 CLAUDE.md
-FINDINGS.md
-fable-findings.md
-TODO.md
 scripts/local.env
 .claude/

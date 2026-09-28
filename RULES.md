@@ -2,11 +2,11 @@
 
 Eine konsistente Spezifikation aller Eingabeformate. Diese Datei ist die
 Quelle der Wahrheit — wenn die Implementierung abweicht, ist die
-Implementierung falsch. Bekannte Abweichungen stehen in der lokalen, nicht versionierten `TODO.md`;
+Implementierung falsch. Bekannte Abweichungen stehen in [BACKLOG.md](BACKLOG.md);
 diese Spezifikation ist keine Behauptung vollständiger Implementierung.
 
 This German-language document specifies the intended input semantics. Known
-implementation gaps are tracked locally in the unversioned `TODO.md`.
+implementation gaps are tracked in [BACKLOG.md](BACKLOG.md).
 
 ## Zwei Default-Regeln, immer
 
