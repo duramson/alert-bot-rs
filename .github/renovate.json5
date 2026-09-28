@@ -9,8 +9,10 @@
   ],
 
   timezone: "Europe/Berlin",
-  // One batched run per week, off-hours. A predictable cadence beats a trickle.
-  schedule: ["before 6am on monday"],
+  // One batched run per week. The hosted Renovate app only runs a repo every
+  // so often, so the window must be wide enough for a run to land in it —
+  // with "before 6am on monday" no run hit the window for seven weeks.
+  schedule: ["on monday"],
 
   // Keep noise bounded even in a busy week.
   prConcurrentLimit: 5,
@@ -25,7 +27,7 @@
   // patched transitive crates between our own commits. Auto-merged on green.
   lockFileMaintenance: {
     enabled: true,
-    schedule: ["before 6am on monday"],
+    schedule: ["on monday"],
     automerge: true,
   },
 
@@ -50,6 +52,19 @@
       labels: ["dependencies", "major"],
     },
 
+    // --- Cargo: 0.x minor bumps are breaking ------------------------------
+    // Cargo treats 0.8 -> 0.9 as incompatible, Renovate calls it "minor".
+    // Keep these out of the auto-merged group (sqlx 0.9 renamed its
+    // features and broke the whole grouped PR).
+    {
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor"],
+      matchCurrentVersion: "<1.0.0",
+      groupName: "cargo 0.x breaking",
+      automerge: false,
+      labels: ["dependencies", "major"],
+    },
+
     // --- reqwest: pinned to teloxide's line ------------------------------
     // reqwest is a PUBLIC dependency of teloxide: Bot::with_client(_, reqwest::
     // Client) exposes reqwest's types in teloxide's public API, and teloxide
@@ -66,10 +81,35 @@
 
     // --- GitHub Actions --------------------------------------------------
     // Low-risk, grouped, auto-merged (digests kept fresh by the helper above).
+    // Majors need a human: an auto-merged major once moved the runner and the
+    // CI Postgres image without review.
     {
       matchManagers: ["github-actions"],
       groupName: "github actions",
       automerge: true,
+    },
+    {
+      matchManagers: ["github-actions"],
+      matchUpdateTypes: ["major"],
+      automerge: false,
+    },
+
+    // --- Runner image: pinned on purpose ---------------------------------
+    // The deploy binary is built on ubuntu-22.04 so its glibc baseline stays
+    // below Debian 13 on the LXC. Never bump it automatically.
+    {
+      matchDatasources: ["github-runners"],
+      enabled: false,
+    },
+
+    // --- Postgres: stay on production's major ----------------------------
+    // Production runs native Postgres 16; CI and docker-compose must match.
+    // A major bump needs a planned pg_upgrade on the LXC, not a PR.
+    {
+      matchDatasources: ["docker"],
+      matchPackageNames: ["postgres"],
+      matchUpdateTypes: ["major"],
+      enabled: false,
     },
   ],
 }
