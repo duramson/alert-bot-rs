@@ -39,8 +39,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Bumped after dropping a chunk of workspace deps — restore-keys
-          # was pulling in a stale target/ from the previous tree.
-          prefix-key: "v2-native"
+          # was pulling in a stale target/ from the previous tree. The key
+          # does not include the runner image, so it names it: a target/
+          # built on another image fails with "can't find crate".
+          prefix-key: "v3-ubuntu-22.04"
           # Save the cache even when later steps fail, otherwise iterating
           # on the deploy step (which is failing on Cloudflare Access right
           # now) keeps blowing the build cache and we rebuild ~250 crates
@@ -68,7 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: "v2-native"
+          prefix-key: "v3-ubuntu-22.04"
 
       - name: Build release binary
         run: |
