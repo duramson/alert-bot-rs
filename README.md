@@ -33,7 +33,7 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
   `/alert 30.4.26 text`, `/alert 2026-04-30 text`, `/alert 2pm text`,
   `/alert morgen 9 Uhr text`, `/alert do 14:00 text`. Case-sensitive `M`/`Y`
   for months / years (lowercase `m` = minute). Full input contract in
-  [RULES.md](RULES.md). Known deviations are tracked in the local, unversioned `TODO.md`.
+  [RULES.md](RULES.md). Known deviations are tracked in the local, unversioned `BACKLOG.md`.
 - **Recurring** — `*` prefix or `every`/`alle`/`jeden`. `*30m water`,
   `*1d vitamin`, `*do 14:00 standup`, `*mo,mi,fr 9 yoga`, `*1. rent`,
   `*24.12 christmas`. `*31.` and `*29.2` fall back to the last day of the
@@ -401,7 +401,7 @@ flowchart TD
       then `systemctl restart alert-bot`.
 3. **Tail** — 20s of `journalctl -u alert-bot -f` for inspection. This currently
    does not fail the job on a later startup error; readiness checks remain open
-   in `TODO.md`.
+   in `BACKLOG.md`.
 
 No GitHub Release roundtrip — keeps the repo free to stay private.
 
@@ -463,7 +463,7 @@ crates/
   fails the process so `Restart=on-failure` can restart it.
 - **Update deduplication** — `processed_updates` records IDs before handlers run.
   This suppresses repeated input, but currently also suppresses retries after
-  handler errors (F07 in `TODO.md`). Delivery can still duplicate when
+  handler errors (F07 in `BACKLOG.md`). Delivery can still duplicate when
   Telegram accepts a send but its response or the database finalisation is lost;
   claim fencing does not provide exactly-once delivery.
 
@@ -489,7 +489,7 @@ in CI; the worker test uses a local mock Telegram endpoint. No real bot is neede
 
 ## Remaining work
 
-Open review findings and feature ideas are maintained locally in `TODO.md`
+Open review findings and feature ideas are maintained locally in `BACKLOG.md`
 (not versioned).
 
 ## License
