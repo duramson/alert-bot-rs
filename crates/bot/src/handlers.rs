@@ -6,8 +6,8 @@ use chrono::Utc;
 use chrono_tz::Tz;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
-    PublicChatKind, Recipient, UserId,
+    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardButtonKind,
+    InlineKeyboardMarkup, InputFile, ParseMode, PublicChatKind, Recipient, UserId,
 };
 
 use botcore::{AlertScope, ChatType, Language, NewAlert, Schedule};
@@ -15,35 +15,25 @@ use parser::ParseContext;
 use storage::PgStore;
 
 use crate::commands::Command;
-use crate::limits::{self, CommandRateLimiter};
+use crate::identity;
+use crate::limits;
 use crate::messages as m;
 use crate::render;
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-pub async fn dispatch(
-    bot: Bot,
-    msg: Message,
-    cmd: Command,
-    store: Arc<PgStore>,
-    limiter: Arc<CommandRateLimiter>,
-) -> HandlerResult {
-    let user_id = match msg.from.as_ref() {
-        Some(u) => u.id.0 as i64,
-        None => return Ok(()), // anonymous channel posts: ignore
-    };
-    let detected_lang = Language::from_telegram_code(
-        msg.from.as_ref().and_then(|u| u.language_code.as_deref()),
-    );
-
-    // Rate-limit before touching the DB. A spammer who blew past their
-    // per-minute budget shouldn't get free upsert_user calls.
-    if !limiter.check(user_id) {
-        bot.send_message(msg.chat.id, m::rate_limited(detected_lang))
-            .await
-            .ok();
+pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>) -> HandlerResult {
+    // Telegram supplies a compatibility-only fake `from` user when a message
+    // is sent on behalf of a chat (including anonymous group administrators).
+    // It is not a person identity and must never own a private alert.
+    let Some(user_id) = trusted_sender_id(
+        msg.from.as_ref().map(|user| user.id.0),
+        msg.sender_chat.is_some(),
+    ) else {
         return Ok(());
-    }
+    };
+    let detected_lang =
+        Language::from_telegram_code(msg.from.as_ref().and_then(|u| u.language_code.as_deref()));
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -440,25 +430,26 @@ async fn update_chat_command_menu_if_dm(bot: &Bot, msg: &Message, lang: Language
 // Callback queries (inline keyboard button clicks)
 // ---------------------------------------------------------------------------
 
+/// Answer a callback the ingress rate limit rejected. Without an answer the
+/// button's loading indicator keeps spinning until Telegram gives up.
+pub async fn answer_rate_limited_callback(bot: &Bot, query: &CallbackQuery) {
+    let lang = Language::from_telegram_code(query.from.language_code.as_deref());
+    bot.answer_callback_query(query.id.clone())
+        .text(m::rate_limited(lang))
+        .show_alert(false)
+        .await
+        .ok();
+}
+
 pub async fn callback_dispatch(
     bot: Bot,
     query: CallbackQuery,
     store: Arc<PgStore>,
-    limiter: Arc<CommandRateLimiter>,
 ) -> HandlerResult {
-    let user_id = query.from.id.0 as i64;
-    let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
-
-    // Callbacks count against the same per-user budget as commands —
-    // otherwise a scripted client could spam +5m on every button forever.
-    if !limiter.check(user_id) {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::rate_limited(detected_lang))
-            .show_alert(false)
-            .await
-            .ok();
+    let Some(user_id) = identity::user_id(query.from.id.0) else {
         return Ok(());
-    }
+    };
+    let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -657,7 +648,11 @@ async fn handle_cancel_callback(
     let ok = store.cancel_alert(alert_id, requester).await?;
 
     if ok {
-        if let Some(msg) = query.message.as_ref() {
+        if let Some(msg) = query
+            .message
+            .as_ref()
+            .filter(|_| source_message_offers(query))
+        {
             bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
                 .await
                 .ok();
@@ -810,11 +805,34 @@ async fn handle_stop_series_callback(
     Ok(())
 }
 
-/// Remove the inline keyboard from the message that originated this callback.
-/// Best-effort: silently ignores edit failures (most common one being a
-/// message older than Telegram's 48h edit window).
+/// Whether the callback's source message carries a button with exactly this
+/// callback data. Telegram supplies the source message, but a client can send
+/// any callback data, so only a matching button ties the message to the alert
+/// that the data names. Edits to the source message require this.
+fn source_message_offers(query: &CallbackQuery) -> bool {
+    let (Some(data), Some(msg)) = (
+        query.data.as_deref(),
+        query.message.as_ref().and_then(|m| m.regular_message()),
+    ) else {
+        return false;
+    };
+    msg.reply_markup().is_some_and(|markup| {
+        markup.inline_keyboard.iter().flatten().any(
+            |button| matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(d) if d == data),
+        )
+    })
+}
+
+/// Remove the inline keyboard from the message that originated this callback,
+/// if that message offered this callback. Best-effort: silently ignores edit
+/// failures (most common one being a message older than Telegram's 48h edit
+/// window).
 async fn clear_inline_buttons(bot: &Bot, query: &CallbackQuery) {
-    if let Some(msg) = query.message.as_ref() {
+    if let Some(msg) = query
+        .message
+        .as_ref()
+        .filter(|_| source_message_offers(query))
+    {
         let empty: InlineKeyboardMarkup =
             InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
         bot.edit_message_reply_markup(msg.chat().id, msg.id())
@@ -844,7 +862,9 @@ pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> Ha
     let Some(from) = msg.from.as_ref() else {
         return Ok(());
     };
-    let user_id = from.id.0 as i64;
+    let Some(user_id) = identity::user_id(from.id.0) else {
+        return Ok(());
+    };
     let detected_lang = Language::from_telegram_code(from.language_code.as_deref());
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -882,6 +902,14 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn trusted_sender_id(from_id: Option<u64>, has_sender_chat: bool) -> Option<i64> {
+    if has_sender_chat {
+        None
+    } else {
+        from_id.and_then(identity::user_id)
+    }
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -937,7 +965,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use teloxide::requests::HasPayload;
-    use teloxide::types::InlineKeyboardButtonKind;
 
     const MEMBER: &str = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
     const LEFT: &str = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"left"}}"#;
@@ -1217,6 +1244,14 @@ mod tests {
         assert_eq!(callback_data(&row[3]), "stop_series:7");
     }
 
+    #[test]
+    fn chat_backed_messages_never_become_private_alert_owners() {
+        assert_eq!(trusted_sender_id(Some(42), false), Some(42));
+        assert_eq!(trusted_sender_id(None, false), None);
+        assert_eq!(trusted_sender_id(Some(1_087_968_824), true), None);
+        assert_eq!(trusted_sender_id(Some(i64::MAX as u64 + 1), false), None);
+    }
+
     fn service_message(chat: serde_json::Value, field: &str, id: i64) -> Message {
         let mut message = serde_json::json!({
             "message_id": 1,
@@ -1302,4 +1337,28 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert!(pages.iter().all(|page| page.visible_len <= 4000));
     }
+
+    #[tokio::test]
+    async fn rate_limited_callbacks_are_answered_in_the_users_language() {
+        let (bot, requests, server) = mock_telegram(MEMBER).await;
+        let query: CallbackQuery = serde_json::from_str(
+            r#"{
+                "id":"callback-id",
+                "from":{"id":42,"is_bot":false,"first_name":"Test","language_code":"en"},
+                "chat_instance":"instance-id",
+                "data":"cancel:1"
+            }"#,
+        )
+        .unwrap();
+        answer_rate_limited_callback(&bot, &query).await;
+        server.abort();
+
+        let requests = recorded(&requests);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/AnswerCallbackQuery"));
+        assert!(requests[0].1.contains(m::rate_limited(Language::En)));
+    }
 }
+
+#[cfg(test)]
+mod callback_tests;
