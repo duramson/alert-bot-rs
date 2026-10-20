@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use teloxide::dispatching::ShutdownToken;
-use teloxide::update_listeners::webhooks;
 use teloxide::prelude::*;
-use teloxide::types::BotCommand;
+use teloxide::types::{BotCommand, Me, UpdateKind};
+use teloxide::utils::command::BotCommands;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -15,19 +15,24 @@ use url::Url;
 use storage::PgStore;
 
 mod admin;
+mod bounded_http;
 mod commands;
 mod handlers;
+mod identity;
 mod limits;
 mod messages;
 mod render;
 mod stats;
+mod webhook;
 mod worker;
 
 use admin::AdminNotifier;
 use commands::Command;
-use limits::CommandRateLimiter;
+use limits::{CommandRateLimiter, RateLimit};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DISPATCH_SHARDS: i64 = 16;
+const DISPATCH_WORKER_QUEUE_SIZE: usize = 8;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -64,13 +69,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { worker::run(bot, store, shutdown).await })
     };
 
-    // Opt-in read-only stats endpoint (Homepage widget). Separate axum server
-    // on its own LAN-only port — doesn't touch the webhook listener below.
-    if let Some(addr) = config.stats_listen {
+    // Opt-in authenticated stats endpoint (Homepage widget). Its separate
+    // axum server doesn't touch the webhook listener below.
+    if let Some(stats_config) = config.stats {
         let store = store.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = stats::run(store, addr, shutdown).await {
+            if let Err(e) =
+                stats::run(store, stats_config.listen, stats_config.token, shutdown).await
+            {
                 tracing::error!(error = ?e, "stats server exited with error");
             }
         });
@@ -81,10 +88,34 @@ async fn main() -> Result<()> {
     let rate_limiter = Arc::new(CommandRateLimiter::new());
 
     let handler = dptree::entry()
-        // Telegram retries webhook deliveries on timeout — drop duplicates by
-        // update_id. Errors are logged and we fall through (better to risk a
-        // duplicate than to silently swallow the update).
-        .filter_async(|update: Update, store: Arc<PgStore>| async move {
+        // Reject unsupported update kinds, and commands or callbacks from
+        // exhausted users, before the persistent deduplication write.
+        // Otherwise edited/channel updates or a command flood can grow
+        // processed_updates without reaching a rate-limited handler.
+        .filter_async(|update: Update, bot: Bot, me: Me, store: Arc<PgStore>, limiter: Arc<CommandRateLimiter>| async move {
+            let Some(user_id) = ingress_user_id(&update) else {
+                return false;
+            };
+            if is_rate_limited(&update, &me) {
+                match limiter.check(user_id) {
+                    RateLimit::Allowed => {}
+                    // Rate-limited commands stay silent, but an unanswered
+                    // callback leaves the button's loading indicator spinning.
+                    RateLimit::UserBudgetExhausted => {
+                        if let UpdateKind::CallbackQuery(query) = &update.kind {
+                            handlers::answer_rate_limited_callback(&bot, query).await;
+                        }
+                        return false;
+                    }
+                    // Forged updates with fresh IDs reach the shared ceilings
+                    // in bulk; answering them would cost one outbound call each.
+                    RateLimit::SharedCeiling => return false,
+                }
+            }
+
+            // Telegram retries webhook deliveries on timeout. Drop duplicates
+            // by update_id. On a deduplication error, continue rather than
+            // silently losing an otherwise valid update.
             match store.try_register_update(update.id.0 as i64).await {
                 Ok(fresh) => fresh,
                 Err(e) => {
@@ -106,6 +137,15 @@ async fn main() -> Result<()> {
     // and feeds the dispatcher's ShutdownToken on either.
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![store.clone(), rate_limiter.clone()])
+        // Teloxide otherwise creates one worker and queue per sender-chosen
+        // chat id. Fixed shards preserve per-chat ordering while bounding the
+        // total workers and making webhook backpressure reach the HTTP queue.
+        .distribution_function(dispatch_shard)
+        .worker_queue_size(DISPATCH_WORKER_QUEUE_SIZE)
+        // Root filters intentionally drop unsupported and rate-limited input.
+        // Teloxide's default handler logs the complete Debug update, including
+        // user text, so a rejected flood would also flood the journal.
+        .default_handler(|_| async {})
         .build();
 
     spawn_signal_handler(
@@ -121,11 +161,7 @@ async fn main() -> Result<()> {
                 url,
                 secret,
             } => {
-                let mut options = webhooks::Options::new(listen, url);
-                if let Some(s) = secret {
-                    options = options.secret_token(s);
-                }
-                let listener = webhooks::axum(bot.clone(), options)
+                let (listener, server) = webhook::start(bot.clone(), listen, url, secret)
                     .await
                     .context("setting up webhook listener")?;
                 dispatcher
@@ -134,6 +170,7 @@ async fn main() -> Result<()> {
                         LoggingErrorHandler::with_custom_text("webhook listener error"),
                     )
                     .await;
+                server.await.context("webhook server task failed")??;
             }
             Transport::Polling => {
                 // Local-dev fallback. Requires no public endpoint.
@@ -154,6 +191,54 @@ async fn main() -> Result<()> {
     }
     notifier.notify("🛑 alert-bot stopped").await;
     result
+}
+
+fn ingress_user_id(update: &Update) -> Option<i64> {
+    match &update.kind {
+        UpdateKind::Message(message)
+            if message.sender_chat.is_none() && !is_direct_messages_chat_id(message.chat.id.0) =>
+        {
+            message
+                .from
+                .as_ref()
+                .and_then(|user| identity::user_id(user.id.0))
+        }
+        UpdateKind::CallbackQuery(query)
+            if query
+                .message
+                .as_ref()
+                .is_none_or(|message| !is_direct_messages_chat_id(message.chat().id.0)) =>
+        {
+            identity::user_id(query.from.id.0)
+        }
+        _ => None,
+    }
+}
+
+/// Only commands for this bot and callbacks use the rate limit, as before.
+/// Other group messages are ignored by the handlers and must not consume a
+/// member's or the global budget.
+fn is_rate_limited(update: &Update, me: &Me) -> bool {
+    match &update.kind {
+        UpdateKind::CallbackQuery(_) => true,
+        UpdateKind::Message(message) => message
+            .text()
+            .is_some_and(|text| Command::parse(text, me.username()).is_ok()),
+        _ => false,
+    }
+}
+
+fn is_direct_messages_chat_id(chat_id: i64) -> bool {
+    (-4_000_000_000_000..=-2_002_147_483_649).contains(&chat_id)
+}
+
+fn dispatch_shard(update: &Update) -> Option<u8> {
+    let key = update
+        .chat()
+        .map(|chat| chat.id.0)
+        .or_else(|| ingress_user_id(update))
+        .unwrap_or(i64::from(update.id.0));
+    Some(key.rem_euclid(DISPATCH_SHARDS) as u8)
 }
 
 /// Observe the worker while dispatching. A dead delivery task must fail the
@@ -194,16 +279,21 @@ struct Config {
     database_url: String,
     transport: Transport,
     admin_chat_id: Option<i64>,
-    /// Optional LAN-only address for the read-only `/stats` endpoint. `None`
-    /// (env unset) means the stats server doesn't start at all.
-    stats_listen: Option<SocketAddr>,
+    /// Optional authenticated `/stats` endpoint. `None` means the stats
+    /// server doesn't start at all.
+    stats: Option<StatsConfig>,
+}
+
+struct StatsConfig {
+    listen: SocketAddr,
+    token: String,
 }
 
 enum Transport {
     Webhook {
         listen: SocketAddr,
         url: Url,
-        secret: Option<String>,
+        secret: String,
     },
     Polling,
 }
@@ -213,11 +303,15 @@ enum Transport {
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Transport::Webhook { listen, url, secret } => f
+            Transport::Webhook {
+                listen,
+                url,
+                secret: _,
+            } => f
                 .debug_struct("Webhook")
                 .field("listen", listen)
                 .field("url", &url.as_str())
-                .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+                .field("secret", &"<redacted>")
                 .finish(),
             Transport::Polling => f.write_str("Polling"),
         }
@@ -237,8 +331,14 @@ impl Config {
                     .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
                     .parse()
                     .context("WEBHOOK_LISTEN is not a valid socket address")?;
-                let secret = std::env::var("WEBHOOK_SECRET").ok().filter(|s| !s.is_empty());
-                Transport::Webhook { listen, url, secret }
+                let secret = std::env::var("WEBHOOK_SECRET")
+                    .context("WEBHOOK_SECRET is required in webhook mode")?;
+                validate_webhook_secret(&secret)?;
+                Transport::Webhook {
+                    listen,
+                    url,
+                    secret,
+                }
             }
         };
 
@@ -250,22 +350,62 @@ impl Config {
             ),
         };
 
-        let stats_listen = match std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()) {
-            None => None,
-            Some(s) => Some(
-                s.parse::<SocketAddr>()
-                    .context("STATS_LISTEN is not a valid socket address")?,
-            ),
-        };
+        let stats = parse_stats_config(
+            std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()),
+            std::env::var("STATS_TOKEN").ok(),
+        )?;
 
         Ok(Self {
             bot_token,
             database_url,
             transport,
             admin_chat_id,
-            stats_listen,
+            stats,
         })
     }
+}
+
+fn validate_webhook_secret(secret: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=256).contains(&secret.len()),
+        "WEBHOOK_SECRET must contain 32 to 256 characters"
+    );
+    anyhow::ensure!(
+        secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "WEBHOOK_SECRET may only contain A-Z, a-z, 0-9, _ and -"
+    );
+    Ok(())
+}
+
+fn validate_stats_token(token: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=256).contains(&token.len()),
+        "STATS_TOKEN must contain 32 to 256 characters"
+    );
+    anyhow::ensure!(
+        token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "STATS_TOKEN may only contain A-Z, a-z, 0-9, _ and -"
+    );
+    Ok(())
+}
+
+fn parse_stats_config(
+    listen: Option<String>,
+    token: Option<String>,
+) -> Result<Option<StatsConfig>> {
+    let Some(listen) = listen else {
+        return Ok(None);
+    };
+    let listen = listen
+        .parse::<SocketAddr>()
+        .context("STATS_LISTEN is not a valid socket address")?;
+    let token = token.context("STATS_TOKEN is required when STATS_LISTEN is set")?;
+    validate_stats_token(&token)?;
+    Ok(Some(StatsConfig { listen, token }))
 }
 
 fn init_tracing() {
@@ -385,6 +525,43 @@ mod supervision_tests {
     use std::future::pending;
     use std::time::Duration;
 
+    fn message_update(chat_id: i64, chat_type: &str) -> Update {
+        serde_json::from_str(&format!(
+            r#"{{
+                "update_id": 1,
+                "message": {{
+                    "message_id": 1,
+                    "date": 1,
+                    "chat": {{ "id": {chat_id}, "type": "{chat_type}" }},
+                    "from": {{ "id": 7, "is_bot": false, "first_name": "Ada" }},
+                    "text": "/help"
+                }}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    fn callback_update(chat_id: i64) -> Update {
+        serde_json::from_str(&format!(
+            r#"{{
+                "update_id": 2,
+                "callback_query": {{
+                    "id": "callback-id",
+                    "from": {{ "id": 7, "is_bot": false, "first_name": "Ada" }},
+                    "chat_instance": "instance-id",
+                    "message": {{
+                        "message_id": 2,
+                        "date": 1,
+                        "chat": {{ "id": {chat_id}, "type": "supergroup" }},
+                        "text": "alert"
+                    }},
+                    "data": "cancel:1"
+                }}
+            }}"#
+        ))
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn worker_failures_interrupt_a_running_dispatcher() {
         for outcome in 0..3 {
@@ -446,5 +623,156 @@ mod supervision_tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn webhook_secret_requires_telegram_charset_and_minimum_length() {
+        assert!(validate_webhook_secret("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_webhook_secret("short").is_err());
+        assert!(validate_webhook_secret("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn stats_token_requires_safe_charset_and_minimum_length() {
+        assert!(validate_stats_token("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_stats_token("short").is_err());
+        assert!(validate_stats_token("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn stats_listener_requires_a_strong_token() {
+        assert!(parse_stats_config(Some("0.0.0.0:8081".to_owned()), None).is_err());
+        let config = parse_stats_config(
+            Some("0.0.0.0:8081".to_owned()),
+            Some("0123456789abcdef0123456789abcdef".to_owned()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.listen, "0.0.0.0:8081".parse().unwrap());
+    }
+
+    #[test]
+    fn dispatcher_uses_a_fixed_number_of_shards() {
+        let first: Update = serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":-42,"type":"group"},"text":"/help"}}"#,
+        )
+        .unwrap();
+        let second: Update = serde_json::from_str(
+            r#"{"update_id":2,"message":{"message_id":2,"date":0,"chat":{"id":-42,"type":"group"},"text":"/list"}}"#,
+        )
+        .unwrap();
+        let future: Update =
+            serde_json::from_str(r#"{"update_id":4294967295,"future_update":{}}"#).unwrap();
+
+        assert_eq!(dispatch_shard(&first), dispatch_shard(&second));
+        for update in [&first, &second, &future] {
+            assert!(dispatch_shard(update).unwrap() < DISPATCH_SHARDS as u8);
+        }
+    }
+
+    #[test]
+    fn direct_messages_chat_id_range_is_rejected_at_both_boundaries() {
+        for chat_id in [-4_000_000_000_000, -2_002_147_483_649] {
+            assert_eq!(
+                ingress_user_id(&message_update(chat_id, "supergroup")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn chat_ids_just_outside_direct_messages_range_are_preserved() {
+        for chat_id in [-4_000_000_000_001, -2_002_147_483_648] {
+            assert_eq!(
+                ingress_user_id(&message_update(chat_id, "supergroup")),
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_private_group_and_supergroup_messages_are_preserved() {
+        for (chat_id, chat_type) in [
+            (7, "private"),
+            (-42, "group"),
+            (-1_000_000_000_001, "supergroup"),
+        ] {
+            assert_eq!(
+                ingress_user_id(&message_update(chat_id, chat_type)),
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn sender_chat_messages_remain_rejected() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 3,
+                "message": {
+                    "message_id": 3,
+                    "date": 1,
+                    "chat": { "id": -42, "type": "group" },
+                    "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
+                    "sender_chat": { "id": -100, "type": "channel" },
+                    "text": "/help"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(ingress_user_id(&update), None);
+    }
+
+    fn me() -> Me {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "is_bot": true,
+            "first_name": "Alert",
+            "username": "alert_bot",
+            "can_join_groups": true,
+            "can_read_all_group_messages": false,
+            "supports_inline_queries": false,
+            "can_connect_to_business": false,
+            "has_main_web_app": false
+        }))
+        .unwrap()
+    }
+
+    fn text_update(text: &str) -> Update {
+        // Update deserializes reliably only from text, not from a Value.
+        serde_json::from_str(
+            &serde_json::json!({
+            "update_id": 4,
+            "message": {
+                "message_id": 4,
+                "date": 1,
+                "chat": { "id": -42, "type": "group" },
+                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
+                "text": text
+            }
+        })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_commands_and_callbacks_use_the_rate_limit() {
+        let me = me();
+        assert!(is_rate_limited(&message_update(-42, "group"), &me));
+        assert!(is_rate_limited(&text_update("/list@alert_bot"), &me));
+        assert!(is_rate_limited(&callback_update(-42), &me));
+        assert!(!is_rate_limited(&text_update("good morning"), &me));
+        assert!(!is_rate_limited(&text_update("/list@other_bot"), &me));
+    }
+
+    #[test]
+    fn callbacks_from_direct_messages_chats_are_rejected() {
+        assert_eq!(ingress_user_id(&callback_update(-2_002_147_483_649)), None);
+        assert_eq!(
+            ingress_user_id(&callback_update(-1_000_000_000_001)),
+            Some(7)
+        );
     }
 }
