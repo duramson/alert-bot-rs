@@ -112,14 +112,55 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
     };
 
     let keyboard = handlers::delivery_keyboard(lang, alert.id, alert.schedule.is_recurring());
-    let send = bot
+    let request = bot
         .send_message(ChatId(alert.chat_id), &body)
-        .reply_markup(keyboard)
-        .send()
-        .await;
+        .reply_markup(keyboard);
+    match store.begin_delivery(alert.id, alert.claim_generation).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                id = alert.id,
+                generation = alert.claim_generation,
+                "delivery claim was cancelled or reassigned before send"
+            );
+            return;
+        }
+        Err(e) => {
+            error!(
+                id = alert.id,
+                generation = alert.claim_generation,
+                error = ?e,
+                "begin_delivery failed"
+            );
+            return;
+        }
+    }
+    let send = request.send().await;
 
     match send {
-        Ok(_) => {
+        Ok(message) => {
+            match store
+                .record_alert_delivery(
+                    alert.id,
+                    alert.claim_generation,
+                    alert.chat_id,
+                    i64::from(message.id.0),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    id = alert.id,
+                    generation = alert.claim_generation,
+                    "delivery has no snooze receipt; callback will fail closed"
+                ),
+                Err(e) => error!(
+                    id = alert.id,
+                    generation = alert.claim_generation,
+                    error = ?e,
+                    "record_alert_delivery failed; callback will fail closed"
+                ),
+            }
             if let Err(e) = finalise_after_send(store, &alert).await {
                 error!(id = alert.id, error = ?e, "finalise_after_send failed");
             }
@@ -218,9 +259,9 @@ async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<(
         }
     };
     if !applied {
-        // The claim guard rejected the write: the reaper released our claim
-        // while the send was in flight and the row was re-claimed or cancelled
-        // meanwhile. Don't resurrect it — just note the wasted double-send.
+        // The generation guard rejected the write: the reaper released our
+        // send lease and another worker re-claimed it. Don't overwrite the
+        // new owner; this remains an at-least-once delivery boundary.
         warn!(
             id = alert.id,
             "delivered but claim was no longer ours; not finalising"

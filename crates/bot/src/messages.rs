@@ -526,6 +526,20 @@ pub fn lang_invalid(lang: Language) -> &'static str {
     }
 }
 
+pub fn snooze_already_created(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Dieser Reminder wurde bereits verschoben.",
+        Language::En => "This reminder was already snoozed.",
+    }
+}
+
+pub fn cancel_delivery_started(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Die Zustellung hat bereits begonnen. Der Reminder wurde nicht gelöscht.",
+        Language::En => "Delivery has already started. The reminder was not cancelled.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
